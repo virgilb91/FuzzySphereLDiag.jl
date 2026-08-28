@@ -16,9 +16,8 @@
 #  talking to, which is why part 3 is a two-line change between backends.
 # =============================================================================
 using FuzzifiED, LinearAlgebra, Printf
+using FuzzySphereLDiag
 FuzzifiED.SilentStd = true
-include(joinpath(@__DIR__, "..", "src", "FuzzySphereLDiag.jl"))
-using .FuzzySphereLDiag
 
 head(s) = (println(); println("="^76); println("  ", s); println("="^76))
 
