@@ -18,13 +18,6 @@ using Pkg
 Pkg.add("FuzzySphereLDiag")
 ```
 
-or 
-
-```julia
-using Pkg
-Pkg.add(url = "https://github.com/virgilb91/FuzzySphereLDiag.jl")
-```
-
 The tutorial additionally compares against [FuzzifiED](https://github.com/FuzzifiED/FuzzifiED.jl),
 which is not a dependency of the library itself:
 

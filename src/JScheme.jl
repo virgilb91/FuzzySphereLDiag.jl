@@ -25,11 +25,11 @@ both agree with this solver to every printed digit.
 Dependencies: LinearAlgebra (stdlib) and Arpack for the
 iterative eigensolver (dense fallback below `dense_limit`).
 
-Usage:
-  julia -t 8 JScheme.jl --N 16
-  julia -t 8 JScheme.jl --validate
-or from Julia:
-  include("JScheme.jl"); JScheme.solve(16, 3.153; L = 2, z2 = +1, k = 2)
+Usage, as a submodule of FuzzySphereLDiag:
+  using FuzzySphereLDiag
+  const J = FuzzySphereLDiag.JScheme
+  J.solve(16, 3.153; L = 2, z2 = +1, k = 2)
+  J.validate()
 """
 module JScheme
 
