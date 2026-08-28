@@ -15,8 +15,21 @@ spectra are pinned against FuzzifiED and an independent Python port.
 
 ```julia
 using Pkg
-Pkg.develop(path = "/path/to/FuzzySphereLDiag")   # this directory
-Pkg.test("FuzzySphereLDiag")                      # ~4.5 min, runs both validate suites
+Pkg.add("FuzzySphereLDiag")
+```
+
+The tutorial additionally compares against [FuzzifiED](https://github.com/FuzzifiED/FuzzifiED.jl),
+which is not a dependency of the library itself:
+
+```julia
+Pkg.add("FuzzifiED")          # only for examples/tutorial.jl
+```
+
+To work on the package instead of using it, or to run the test suite:
+
+```julia
+Pkg.develop(path = "/path/to/FuzzySphereLDiag")
+Pkg.test("FuzzySphereLDiag")  # ~4.5 min, runs both validate suites
 ```
 
 ## Quick start
@@ -71,7 +84,8 @@ a rigorous a-posteriori bound, not an estimate. Snapshots go where it is worst.
 ## Tutorial
 
 ```
-julia -t 4 examples/tutorial.jl      # DEFAULT env, so FuzzifiED resolves
+julia -t 4 examples/tutorial.jl      # needs FuzzySphereLDiag and FuzzifiED
+                                     # in the active environment
 ```
 
 1. Ising ground state from FuzzifiED, then from the coupled basis — same number to

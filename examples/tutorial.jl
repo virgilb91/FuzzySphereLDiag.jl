@@ -1,7 +1,10 @@
 # =============================================================================
 #  FuzzySphereLDiag tutorial
 #
-#      julia -t 4 examples/tutorial.jl        (DEFAULT env, so FuzzifiED resolves)
+#      julia -t 4 examples/tutorial.jl
+#
+#  Requires FuzzySphereLDiag and FuzzifiED in the active environment:
+#      using Pkg; Pkg.add(["FuzzySphereLDiag", "FuzzifiED"])
 #
 #  1. Ising ground state: FuzzifiED, then the coupled (exact-L) basis.
 #  2. O(2)  ground state: FuzzifiED, then the coupled (exact-L) basis.
