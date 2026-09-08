@@ -19,7 +19,7 @@ Two ingredients:
 
 Models: the two-flavour Ising model and the three-flavour (spin-1) O(2) model.
 
-Conventions that differ from FuzzifiED, and matter:
+Conventions that differ from FuzzifiED:
 
   * Ising: `ps_pot[l+1] = V_l`.  FuzzifiED's `GetDenIntTerms` takes
     `2 .* ps_pot` when the two flavour projectors are passed separately.
