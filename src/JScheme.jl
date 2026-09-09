@@ -85,28 +85,37 @@ function wigner3j(j1, j2, j3, m1, m2, m3)
     return prefactor * total
 end
 
-const _CG_CACHE = Dict{NTuple{6,Int},Float64}()
-
-function cg(j1, m1, j2, m2, J, M)
-    m1 + m2 != M && return 0.0
-    key = (j1, m1, j2, m2, J, M)
-    get!(_CG_CACHE, key) do
-        phase((j1 - j2 + M) ÷ 2) * sqrt(J + 1.0) *
-            wigner3j(j1, j2, J, m1, m2, -M)
-    end
-end
-
-# 6j caching under threads: a shared cache that is READ-ONLY while threads
-# run, plus one overflow cache per thread for keys not yet shared.  After a
-# threaded build, merge_sixj_caches!() folds the overflows into the shared
-# cache (single-threaded), so later sectors hit it without duplicate work.
+# Wigner-symbol caching under threads: a shared cache that is READ-ONLY while
+# threads run, plus one overflow cache per thread for keys not yet shared.
+# After a threaded build, merge_wigner_caches!() folds the overflows into the
+# shared caches (single-threaded), so later sectors hit them without duplicate
+# work.  A plain shared Dict with get! is NOT usable here -- concurrent writes
+# corrupt it during rehash.
+const _CG_SHARED = Dict{NTuple{6,Int},Float64}()
+const _CG_CACHES = [Dict{NTuple{6,Int},Float64}()
+                    for _ in 1:Threads.maxthreadid()+8]
 const _SIXJ_SHARED = Dict{NTuple{6,Int},Float64}()
 const _SIXJ_CACHES = [Dict{NTuple{6,Int},Float64}()
                       for _ in 1:Threads.maxthreadid()+8]
 
-function merge_sixj_caches!()
+function cg(j1, m1, j2, m2, J, M)
+    m1 + m2 != M && return 0.0
+    key = (j1, m1, j2, m2, J, M)
+    shared = get(_CG_SHARED, key, NaN)
+    isnan(shared) || return shared
+    cache = _CG_CACHES[Threads.threadid()]
+    haskey(cache, key) && return cache[key]
+    return cache[key] = phase((j1 - j2 + M) ÷ 2) * sqrt(J + 1.0) *
+                        wigner3j(j1, j2, J, m1, m2, -M)
+end
+
+function merge_wigner_caches!()
     for c in _SIXJ_CACHES
         merge!(_SIXJ_SHARED, c)
+        empty!(c)
+    end
+    for c in _CG_CACHES
+        merge!(_CG_SHARED, c)
         empty!(c)
     end
 end
