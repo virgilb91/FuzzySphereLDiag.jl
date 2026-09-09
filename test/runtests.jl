@@ -47,4 +47,24 @@ const J = FuzzySphereLDiag.JScheme   # O2Scheme.jl is include()d into JScheme
             @test 2.9600 + kappa(N, V0, V1) / 2 ≈ 5.8975
         end
     end
+
+    @testset "Wigner caches survive threaded use" begin
+        # cg() once used a plain shared Dict with get!; concurrent writes
+        # corrupt it during rehash, which aborts any threaded build.
+        args = vec([(2a, 2b, 2c, 2d, 2e, 2f) for a in 0:3, b in 0:3, c in 0:3,
+                                                 d in 0:3, e in 0:2, f in 0:2])
+        ref6 = [J.sixj(x...) for x in args]
+        refc = [J.cg(x[1], 0, x[2], 0, x[3], 0) for x in args]
+        got6 = fill(NaN, length(args)); gotc = fill(NaN, length(args))
+        Threads.@threads :static for i in eachindex(args)
+            got6[i] = J.sixj(args[i]...)
+            gotc[i] = J.cg(args[i][1], 0, args[i][2], 0, args[i][3], 0)
+        end
+        @test got6 == ref6
+        @test gotc == refc
+        J.merge_wigner_caches!()
+        @test [J.sixj(x...) for x in args] == ref6
+        @test [J.cg(x[1], 0, x[2], 0, x[3], 0) for x in args] == refc
+    end
+
 end
