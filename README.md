@@ -13,35 +13,40 @@ spectra are pinned against FuzzifiED and an independent Python port.
 
 ## Install
 
-The package is not in the General registry, so it is installed from the
-repository rather than by name. Clone it once,
+Clone the package, in a shell:
 
-```
+```sh
 git clone https://github.com/virgilb91/FuzzySphereLDiag.jl
 ```
 
-then pick whichever of the following suits you.
+then pick whichever of the following suits you. The Julia snippets below are
+written for the `julia>` prompt; at the `pkg>` prompt (reached with `]`) the
+same commands drop `Pkg.`, the parentheses and the quotes, as noted under each.
 
 **Use its own environment.** `Project.toml` lists every dependency, so nothing
 else is needed:
 
-```
+```sh
 julia --project=/path/to/FuzzySphereLDiag.jl
 ```
 
 ```julia
-using Pkg; Pkg.instantiate()      # first time only
-using FuzzySphereLDiag
+julia> using Pkg; Pkg.instantiate()      # first time only
+julia> using FuzzySphereLDiag
 ```
+
+At the `pkg>` prompt the first line is just `instantiate`.
 
 **Track the clone from an environment of your own**, so edits to the source take
 effect without reinstalling:
 
 ```julia
-using Pkg
-Pkg.develop(path = "/path/to/FuzzySphereLDiag.jl")
-using FuzzySphereLDiag
+julia> using Pkg
+julia> Pkg.develop(path = "/path/to/FuzzySphereLDiag.jl")
+julia> using FuzzySphereLDiag
 ```
+
+At the `pkg>` prompt: `dev /path/to/FuzzySphereLDiag.jl`.
 
 **Skip the package manager entirely.** The module can be included directly, as
 long as Arpack, LinearAlgebra, Printf, Random and SparseArrays are available in
@@ -49,25 +54,32 @@ the active environment. Included this way it is a local module, so the names
 live under `.FuzzySphereLDiag`:
 
 ```julia
-include("/path/to/FuzzySphereLDiag.jl/src/FuzzySphereLDiag.jl")
-using .FuzzySphereLDiag
+julia> include("/path/to/FuzzySphereLDiag.jl/src/FuzzySphereLDiag.jl")
+julia> using .FuzzySphereLDiag
 ```
 
-A one-line `Pkg.add(url = "https://github.com/virgilb91/FuzzySphereLDiag.jl")`
-also works; it copies a fixed commit into the depot instead of tracking a clone.
+**Or install straight from the URL**, which copies a fixed commit into the depot
+instead of tracking a clone:
+
+```julia
+julia> using Pkg
+julia> Pkg.add(url = "https://github.com/virgilb91/FuzzySphereLDiag.jl")
+```
+
+At the `pkg>` prompt: `add https://github.com/virgilb91/FuzzySphereLDiag.jl`.
 
 The tutorials additionally compare against
 [FuzzifiED](https://github.com/FuzzifiED/FuzzifiED.jl), which is not a dependency
 of the library itself:
 
 ```julia
-Pkg.add("FuzzifiED")          # only for the examples/
+julia> Pkg.add("FuzzifiED")          # only for the examples/
 ```
 
 To run the test suite, from an environment where the package is developed:
 
 ```julia
-Pkg.test("FuzzySphereLDiag")  # a couple of minutes, both validate suites
+julia> Pkg.test("FuzzySphereLDiag")  # a couple of minutes, both validate suites
 ```
 
 ## Quick start
@@ -90,11 +102,12 @@ kappa(8, 4.0, 1.0)                                  # 5.875, see Conventions
 `IsingSector(N, h, ps_pot, L, z2)` takes `ps_pot[l+1] = V_l`; the form
 `IsingSector(N, h, V0, V1, L, z2)` is shorthand for `ps_pot = [V0, V1]`.
 
-## Reduced-basis emulation — model and backend independent
+## Reduced-basis emulation
 
-The emulator takes the parameter box, the **affine pieces** of the Hamiltonian
-as callables `H_j(x) -> H_j*x`, and a **solver** returning the lowest exact
-eigenpairs at a point. Nothing else about the model or the ED code enters.
+The emulator is independent of the model and of the ED backend. It takes the
+parameter box, the **affine pieces** of the Hamiltonian as callables
+`H_j(x) -> H_j*x`, and a **solver** returning the lowest exact eigenpairs at a
+point. Nothing else about the model or the ED code enters.
 
 ```julia
 H = AffineOperator([x -> H1*x, x -> H2*x, x -> H3*x], dim)   # H(θ) = H1 + θ1 H2 + θ2 H3
