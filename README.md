@@ -13,23 +13,61 @@ spectra are pinned against FuzzifiED and an independent Python port.
 
 ## Install
 
+The package is not in the General registry, so it is installed from the
+repository rather than by name. Clone it once,
+
+```
+git clone https://github.com/virgilb91/FuzzySphereLDiag.jl
+```
+
+then pick whichever of the following suits you.
+
+**Use its own environment.** `Project.toml` lists every dependency, so nothing
+else is needed:
+
+```
+julia --project=/path/to/FuzzySphereLDiag.jl
+```
+
+```julia
+using Pkg; Pkg.instantiate()      # first time only
+using FuzzySphereLDiag
+```
+
+**Track the clone from an environment of your own**, so edits to the source take
+effect without reinstalling:
+
 ```julia
 using Pkg
-Pkg.add("FuzzySphereLDiag")
+Pkg.develop(path = "/path/to/FuzzySphereLDiag.jl")
+using FuzzySphereLDiag
 ```
 
-The tutorial additionally compares against [FuzzifiED](https://github.com/FuzzifiED/FuzzifiED.jl),
-which is not a dependency of the library itself:
+**Skip the package manager entirely.** The module can be included directly, as
+long as Arpack, LinearAlgebra, Printf, Random and SparseArrays are available in
+the active environment. Included this way it is a local module, so the names
+live under `.FuzzySphereLDiag`:
 
 ```julia
-Pkg.add("FuzzifiED")          # only for examples/tutorial.jl
+include("/path/to/FuzzySphereLDiag.jl/src/FuzzySphereLDiag.jl")
+using .FuzzySphereLDiag
 ```
 
-To work on the package instead of using it, or to run the test suite:
+A one-line `Pkg.add(url = "https://github.com/virgilb91/FuzzySphereLDiag.jl")`
+also works; it copies a fixed commit into the depot instead of tracking a clone.
+
+The tutorials additionally compare against
+[FuzzifiED](https://github.com/FuzzifiED/FuzzifiED.jl), which is not a dependency
+of the library itself:
 
 ```julia
-Pkg.develop(path = "/path/to/FuzzySphereLDiag")
-Pkg.test("FuzzySphereLDiag")  # ~4.5 min, runs both validate suites
+Pkg.add("FuzzifiED")          # only for the examples/
+```
+
+To run the test suite, from an environment where the package is developed:
+
+```julia
+Pkg.test("FuzzySphereLDiag")  # a couple of minutes, both validate suites
 ```
 
 ## Quick start
@@ -54,10 +92,9 @@ kappa(8, 4.0, 1.0)                                  # 5.875, see Conventions
 
 ## Reduced-basis emulation — model and backend independent
 
-The emulator knows only three things: the parameter box, the **affine pieces**
-of the Hamiltonian as callables `H_j(x) -> H_j*x`, and a **solver** returning the
-lowest exact eigenpairs at a point. It never learns which model or which ED code
-it is talking to.
+The emulator takes the parameter box, the **affine pieces** of the Hamiltonian
+as callables `H_j(x) -> H_j*x`, and a **solver** returning the lowest exact
+eigenpairs at a point. Nothing else about the model or the ED code enters.
 
 ```julia
 H = AffineOperator([x -> H1*x, x -> H2*x, x -> H3*x], dim)   # H(θ) = H1 + θ1 H2 + θ2 H3
@@ -67,9 +104,11 @@ em.res                               # certified residual bound
 ```
 
 Any number of parameters is supported; `box` carries one `(lo, hi)` per
-parameter. Adapters ship for the coupled-basis solver (`jscheme_ising_affine`,
-`ising_emulator`); `examples/tutorial.jl` builds the FuzzifiED adapter in six
-lines and drives the *same* `greedy` with it.
+parameter. Adapters ship for both coupled-basis solvers — `jscheme_ising_affine`
+with `θ = (V0, h)`, `o2_affine` with `θ = (V0, D)`, plus the `ising_emulator`
+convenience wrapper — and the two tutorials drive `greedy` with them. Any other
+backend that can apply its affine pieces to a vector and solve at a point plugs
+into the same `greedy` unchanged.
 
 Why the greedy can work at all: both Hamiltonians are exactly affine, so for any
 θ the **true** residual norm is available in `O(r^2)` without touching the full
@@ -79,22 +118,71 @@ space,
 || (H(θ) - E) Q y ||^2  =  y' B(θ) y - E^2        (Q'Q = I, |y| = 1)
 ```
 
-a rigorous a-posteriori bound, not an estimate. Snapshots go where it is worst.
+which is a rigorous a-posteriori bound rather than an estimate. Each new
+snapshot is placed where that bound is largest.
 
-## Tutorial
+### Observables
+
+The energy is a Ritz value of the projected matrices alone. An observable is a
+norm in the full space, so it needs the snapshot basis, which the emulator
+carries in `em.basis`. For a symmetry-odd operator `O` the quantity that locates
+a transition is the second moment `m^2 = ||O|GS>||^2`; assemble
+`G = (O Ψ)'(O Ψ)` once, and it is free at every coupling afterwards.
+
+```julia
+G = ising_order_param_gram(em, N)          # r applications of O, once
+reduced_expectation(em, G, (4.75, 3.16))   # m^2 anywhere in the box
+emulate_state(em, θ)                       # values and reduced vectors
+```
+
+`o2_order_param_gram` is the O(2) counterpart, where `O` raises the charge and
+maps `(L, Q)` onto `(L, Q+1)`. For checking, `ising_order_parameter` and
+`o2_order_parameter` give `m^2` from a direct diagonalisation.
+
+An emulator can also be grown against an observable instead of the residual.
+`greedy(...; monitor, monitor_tol)` hands `monitor` the emulator built so far
+and stops when the largest relative change in what it returns, between
+consecutive snapshots, falls below `monitor_tol`. That is the rule used for the
+order-parameter figures in the papers. The energy
+typically agrees to `1e-13` and an observable to `1e-9`, because a Ritz value is
+stationary in the error of the state and its own error is second order in it,
+while an expectation value is first order.
+
+## Tutorials
+
+One per model, each self-contained:
 
 ```
-julia -t 4 examples/tutorial.jl      # needs FuzzySphereLDiag and FuzzifiED
-                                     # in the active environment
+julia -t 4 examples/tutorial_ising.jl   # well under a minute
+julia -t 4 examples/tutorial_o2.jl      # its middle part dominates the runtime
 ```
 
-1. Ising ground state from FuzzifiED, then from the coupled basis — same number to
-   `1e-14`, but from a 22-state block instead of 1064, already labelled `(L, Z2)`.
-2. O(2) ground state both ways, `1e-13`, demonstrating the `kappa/2` shift.
-3. Two reduced-basis scans of the same Ising surface, one driven by each ED
-   backend through the identical `greedy`. Both pick 8 snapshots and reach the
-   same certified residual; the two surfaces agree to `6e-14`, and a 40x40 grid
-   costs 8 exact solves instead of 1600.
+Both need FuzzySphereLDiag and FuzzifiED in the active environment. Each is a
+sequence of numbered steps that announces which solver is running, reports the
+construction and solve time of each, and prints a total runtime at the end.
+Every figure quoted in the text is computed by the run.
+
+`tutorial_ising.jl`
+
+1. One ground-state energy from FuzzifiED and from the coupled basis: the same
+   number to `1e-13`, from a block orders of magnitude smaller and already
+   labelled `(L, Z2)`.
+2. A one-parameter emulator at fixed `V0`, grown until the order parameter stops
+   changing, then `m^2` along the field cut. At zero field it returns `N^2`
+   exactly, the fully ordered value.
+3. A two-parameter emulator over the `(V0, h)` plane, with the snapshot
+   locations drawn as a character grid in the order the greedy chose them, then
+   a surface from a handful of exact solves, checked off the snapshots.
+
+`tutorial_o2.jl`
+
+1. The O(2) ground state both ways, demonstrating the `kappa/2` shift. Omitting
+   it makes the two codes disagree in the first digit.
+2. The same run at a larger `N`, where the coupled basis overtakes the m-scheme
+   one; the growth rates and the crossover are computed from the two runs.
+3. A one-parameter emulator at fixed `V0`, grown against `m^2`, giving the
+   anisotropy cut of Fig. 5 of the O(2) paper.
+4. A two-parameter emulator over the `(V0, D)` plane, on the energy alone.
 
 ## References
 
@@ -122,7 +210,7 @@ The models and the methods this package implements:
 
 MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Virgil V. Baran.
 
-FuzzifiED, compared against in the tutorial, is separately MIT-licensed
+FuzzifiED, compared against in the tutorials, is separately MIT-licensed
 (Copyright (c) 2024–2025 Zheng Zhou and contributors) and is a normal package
-dependency of the tutorial only, not of the library.
+dependency of the examples only, not of the library.
 

@@ -1042,7 +1042,8 @@ function ground_state(sector::Sector; tol = 1e-9, maxiter = 2000)
 end
 
 """Like `eigenvalues` but also returns eigenvectors (columns)."""
-function eigensystem(sector::Sector; k = 2, dense_limit = 4000, tol = 1e-9)
+function eigensystem(sector::Sector; k = 2, dense_limit = 4000, tol = 1e-9,
+                     v0 = nothing)
     if sector.dim <= dense_limit
         matrix = dense(sector)
         F = eigen(Symmetric(0.5 .* (matrix .+ matrix')))
@@ -1051,9 +1052,10 @@ function eigensystem(sector::Sector; k = 2, dense_limit = 4000, tol = 1e-9)
     end
     HAVE_ARPACK || error("Arpack.jl required for dim > $dense_limit")
     op = SectorOperator(sector, workspace(sector)...)
-    values, vectors = Arpack.eigs(op; nev = k, which = :SR, tol = tol,
-                                  ncv = min(sector.dim - 1, max(20, 20 * k)),
-                                  maxiter = 3000)
+    kw = (; nev = k, which = :SR, tol = tol,
+          ncv = min(sector.dim - 1, max(20, 20 * k)), maxiter = 3000)
+    values, vectors = v0 === nothing ? Arpack.eigs(op; kw...) :
+                                       Arpack.eigs(op; kw..., v0 = v0)
     order = sortperm(real.(values))
     return real.(values)[order], real.(vectors)[:, order]
 end
