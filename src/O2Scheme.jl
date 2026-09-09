@@ -633,7 +633,7 @@ function O2Sector(N, D, ps_pot::Vector{Float64}, L, Q;
     for l in lists
         append!(tasks, l)
     end
-    merge_sixj_caches!()             # later builds hit the shared 6j cache
+    merge_wigner_caches!()           # later builds hit the shared 6j and CG caches
     # restore frame-ordered task layout: the strided threading interleaves
     # tasks, which destroys matvec cache locality (measured 1.13 -> 1.8 s)
     sort!(tasks; by = t -> (t.fout, t.fin))
