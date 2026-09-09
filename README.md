@@ -207,8 +207,6 @@ The models and the methods this package implements:
 - A. Dey, L. Herviou, C. Mudry, S. Rychkov, A. M. Läuchli,
   *Conformal data for the O(2) Wilson–Fisher CFT ... on the fuzzy sphere*,
   arXiv:2604.18705 — the three-flavour O(2) model used here.
-- K. J. Wiese, *Locating the Ising conformal field theory via the ground-state
-  energy on the fuzzy sphere*, Phys. Rev. B **113**, 085106 (2026).
 - Z. Zhou, *FuzzifiED: A Julia package for numerics on the fuzzy sphere*,
   arXiv:2503.00100 — the reference implementation compared against here.
 - D. Frame *et al.*, *Eigenvector continuation with subspace learning*,
