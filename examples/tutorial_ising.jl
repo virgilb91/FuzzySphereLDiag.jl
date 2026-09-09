@@ -1,7 +1,12 @@
 # =============================================================================
 #  FuzzySphereLDiag -- 3d Ising CFT application
 #
-#      julia -t 4 examples/tutorial_ising.jl    
+#      julia -t 4 examples/tutorial_ising.jl
+#
+#  THE MODEL.  The fuzzy-sphere Ising model of W. Zhu, C. Han, E. Huffman,
+#  J. S. Hofmann and Y.-C. He, Phys. Rev. X 13, 021009 (2023): two flavours of
+#  electron in the lowest Landau level of a monopole sphere, with a short-range
+#  repulsion between them and a transverse field.
 # =============================================================================
 using FuzzifiED, LinearAlgebra, Printf
 using FuzzySphereLDiag
