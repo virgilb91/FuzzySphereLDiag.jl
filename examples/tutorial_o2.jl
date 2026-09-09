@@ -4,12 +4,14 @@
 #      julia -t 4 examples/tutorial_o2.jl             (Part 2 dominates the runtime)
 #
 #  Read examples/tutorial_ising.jl first: it explains what the fuzzy sphere is
-#  and why a basis of definite total angular momentum is worth building.
+#  and how a basis of definite total angular momentum is built.
 #
-#  THE MODEL.  Same lowest Landau level, but each electron now carries three
-#  flavours instead of two, which is a spin-1 degree of freedom.  The
-#  interaction is a flavour-blind repulsion minus an exchange in the xy plane
-#  of that spin, and the tuning knob is a single-ion anisotropy D that pushes
+#  THE MODEL.  The three-flavour model of A. Dey, L. Herviou, C. Mudry,
+#  S. Rychkov and A. M. Läuchli, arXiv:2604.18705.  Same lowest Landau level
+#  as the Ising case, but each electron now carries three flavours instead of
+#  two, which is a spin-1 degree of freedom.  The interaction is a flavour-blind
+#  repulsion minus an exchange in the xy plane of that spin, and the tuning knob
+#  is a single-ion anisotropy D that pushes
 #  the Sz = +-1 flavours up relative to Sz = 0.  Small D lets the exchange
 #  order the spins in the plane; large D empties those flavours and leaves a
 #  unique disordered state.  Between them sits the O(2), or XY, fixed point.
@@ -22,10 +24,11 @@
 #  needs D + kappa/2 there, with kappa supplied by this package.  Get this
 #  wrong and the two codes disagree in the first digit.
 #
-#  Part 1 runs the comparison at the smaller of the two sizes set below, and
-#  Part 2 at the larger, where the coupled basis overtakes the m-scheme one.
-#  Part 3 builds a reduced-basis emulator over the (V0, D) plane and reads the
-#  order parameter along a cut at fixed V0, as in Fig. 5 of the paper.
+#  Part 1 compares the two codes at N = 11, where the coupled basis is already
+#  the faster of the two.  Parts 2 and 3 build emulators at a smaller size, one
+#  over the anisotropy alone, reading the order parameter along the cut as in
+#  Fig. 5 of the accompanying reduced-basis paper, and one over the (V0, D)
+#  plane on the energy.
 #
 #  Needs both packages:  using Pkg; Pkg.add(["FuzzySphereLDiag", "FuzzifiED"])
 # =============================================================================
@@ -38,19 +41,18 @@ head(s) = (println(); println("="^76); println("  ", s); println("="^76); printl
 runtime_start = time()
 
 # -----------------------------------------------------------------------------
-#  Step 1.  Define the couplings, shared by both sizes below.
+#  Step 1.  Define the couplings and the two system sizes.
 # -----------------------------------------------------------------------------
 V0 = 4.0       # Haldane pseudopotential: energy of the closest pair state
 V1 = 1.0       # the next pair state out; this also sets the overall energy scale
 D  = 2.96      # single-ion anisotropy, as it appears in the Hamiltonian we mean
 
-N_small = 8    # the size Part 1 runs
-N_large = 11   # the size Part 2 runs, chosen to sit past the crossover
+N_compare  = 11   # the size Part 1 compares the two codes at
+N_emulator = 8    # the size Parts 2 and 3 emulate at, to keep them quick
 
 # -----------------------------------------------------------------------------
-#  Step 2.  One routine that computes the ground state both ways, so that
-#           Part 2 runs exactly the same code as Part 1 at a larger N.
-#           Returns the two wall times, for the comparison at the end.
+#  Step 2.  One routine that computes the ground state both ways.  It returns
+#           the block sizes and the two wall times, which Part 1 prints.
 # -----------------------------------------------------------------------------
 function ground_state_both_ways(N; V0, V1, D)
 
@@ -128,49 +130,25 @@ function ground_state_both_ways(N; V0, V1, D)
             mscheme_dim   = basis_m.dim)
 end
 
-head("PART 1.  The ground state at N = $N_small, and the D convention")
+head("PART 1.  The ground state at N = $N_compare")
 
-small = ground_state_both_ways(N_small; V0, V1, D)
+comparison = ground_state_both_ways(N_compare; V0, V1, D)
 
 println()
-println("""  Handing FuzzifiED the bare D instead makes the two numbers disagree in the
+@printf("""  Handing FuzzifiED the bare D instead makes the two numbers disagree in the
   first digit.  When comparing two codes, check whether each one normal-orders
   the anisotropy before reading anything into a disagreement.
-""")
 
-head("PART 2.  The same run at N = $N_large, where the coupled basis overtakes")
+  At this size the coupled basis is the faster route, by a factor %.1f on the
+  totals above, from a block %d times smaller.  Both margins widen with N.
 
-println("""  Only N changes.  At the smaller size the coupled basis is the slower of the
-  two, because building its recoupling tables costs more than diagonalizing the
-  m-scheme block.  A few electrons later the order is reversed.
-""")
+  Things to try: k = 5 in o2_levels, to read off the low scaling dimensions of
+  the O(2) CFT.
+""", (comparison.mscheme_build + comparison.mscheme_solve) /
+      (comparison.exactL_build + comparison.exactL_solve),
+     round(Int, comparison.mscheme_dim / comparison.exactL_dim))
 
-large = ground_state_both_ways(N_large; V0, V1, D)
-
-println()
-# Everything quoted below is measured by the two runs above, not written in.
-total(r, kind) = kind === :L ? r.exactL_build + r.exactL_solve :
-                               r.mscheme_build + r.mscheme_solve
-steps    = N_large - N_small
-growth_m = (large.mscheme_dim / small.mscheme_dim) ^ (1 / steps)
-growth_L = (large.exactL_dim  / small.exactL_dim ) ^ (1 / steps)
-
-@printf("""  exact-L divided by FuzzifiED wall time:   %.2f at N = %d,   %.2f at N = %d
-
-  Block size grows by a factor %.1f per electron in the m-scheme against %.1f in
-  the exact-L basis, so the gap keeps widening from here.  The balance inside
-  the exact-L timing shifts as well: solve divided by build is %.2f at N = %d
-  and %.2f at N = %d.
-
-  Things to try: a larger N if you have a few minutes, or k = 5 in o2_levels to
-  read off the low scaling dimensions of the O(2) CFT.
-""", total(small, :L) / total(small, :m), N_small,
-     total(large, :L) / total(large, :m), N_large,
-     growth_m, growth_L,
-     small.exactL_solve / small.exactL_build, N_small,
-     large.exactL_solve / large.exactL_build, N_large)
-
-head("PART 3.  A one-dimensional emulator, and the order parameter")
+head("PART 2.  The order parameter from a one-dimensional emulator")
 
 println("""  Fix V0 and scan the anisotropy alone.  The ordered phase breaks the O(2)
   rotation, so the order parameter carries charge and maps the (L, Q) = (0, 0)
@@ -179,7 +157,7 @@ println("""  Fix V0 and scan the anisotropy alone.  The ordered phase breaks the
 
   This emulator is grown against m^2 rather than the energy: the greedy stops
   once the largest relative change in m^2 along the scan, between consecutive
-  snapshots, falls below the tolerance below.
+  snapshots, falls below m2_tol, set in the next step.
 """)
 
 # -----------------------------------------------------------------------------
@@ -194,7 +172,7 @@ D_scan  = range(D_box...; length = 25)    # coarser grid, for printing
 # -----------------------------------------------------------------------------
 #  Step 4.  Regroup the affine pieces: H(D) = (base + V0_cut * piece_V0) + D * piece_D
 # -----------------------------------------------------------------------------
-affine_2d, solve_2d = o2_affine(N_small, 0, 0)
+affine_2d, solve_2d = o2_affine(N_emulator, 0, 0)
 base, piece_V0, piece_D = affine_2d.pieces
 
 affine_1d = AffineOperator(Function[x -> base(x) .+ V0_cut .* piece_V0(x),
@@ -204,7 +182,7 @@ solve_1d(θ, k, guess = nothing) = solve_2d([V0_cut, θ[1]], k, guess)
 # -----------------------------------------------------------------------------
 #  Step 5.  Grow it, watching m^2 along the whole cut.
 # -----------------------------------------------------------------------------
-watch(em) = (G = o2_order_param_gram(em, N_small);
+watch(em) = (G = o2_order_param_gram(em, N_emulator);
              [reduced_expectation(em, G, (d,)) for d in D_watch])
 
 time_start  = time()
@@ -213,14 +191,14 @@ emulator_1d = greedy(affine_1d, solve_1d, [D_box]; k = 1, tol = 0.0,
 time_1d     = time() - time_start
 
 @printf("  N = %d,  V0 = %.1f fixed,  D in [%.1f, %.1f],  m^2 tolerance %.0e\n",
-        N_small, V0_cut, D_box..., m2_tol)
+        N_emulator, V0_cut, D_box..., m2_tol)
 @printf("  block %d states,  %d snapshots,  %.2f s\n\n",
         affine_1d.dim, length(emulator_1d.pts), time_1d)
 
 # -----------------------------------------------------------------------------
 #  Step 6.  Read the order parameter along the cut.
 # -----------------------------------------------------------------------------
-G_1d = o2_order_param_gram(emulator_1d, N_small)
+G_1d = o2_order_param_gram(emulator_1d, N_emulator)
 m2   = [reduced_expectation(emulator_1d, G_1d, (d,)) for d in D_scan]
 
 println("        D        m^2")
@@ -231,25 +209,25 @@ end
 
 D_check                = D_scan[end ÷ 2]
 m2_emulated            = reduced_expectation(emulator_1d, G_1d, (D_check,))
-energy_exact, m2_exact = o2_order_parameter(N_small, D_check, [V0_cut, V1])
+energy_exact, m2_exact = o2_order_parameter(N_emulator, D_check, [V0_cut, V1])
 @printf("\n  at D = %.4f:  emulated %.6f,  exact %.6f,  relative %.1e\n\n",
         D_check, m2_emulated, m2_exact, abs(m2_emulated - m2_exact) / m2_exact)
 
 @printf("  m^2 falls by %.0f%% across the cut as the anisotropy empties the\n",
         100 * (m2[1] - m2[end]) / m2[1])
-println("""  Sz = +-1 flavours and destroys the planar order.  Fig. 5 of the paper reads
-  the transition off curves like this one at several N.
+println("""  Sz = +-1 flavours and destroys the planar order.  Fig. 5 of the accompanying
+  reduced-basis paper reads the transition off curves like this one at several N.
 """)
 
-head("PART 4.  A two-dimensional emulator over the (V0, D) plane")
+head("PART 3.  A two-dimensional emulator over the (V0, D) plane")
 
-println("""  Both couplings free now, and the energy alone.  The greedy stops on the
-  certified residual, which bounds the error of every emulated point without
-  touching the full space.
+println("""  Here both couplings are free and only the energy is emulated.  The greedy
+  stops on the certified residual, which bounds the error of every emulated
+  point without touching the full space.
 """)
 
 # -----------------------------------------------------------------------------
-#  Step 7.  The region to cover, and the residual tolerance.
+#  Step 7.  The region to cover, at the residual tolerance below.
 # -----------------------------------------------------------------------------
 box          = [(3.0, 5.0),      # range of V0
                 (2.0, 3.8)]      # range of D
@@ -260,12 +238,45 @@ emulator_2d = greedy(affine_2d, solve_2d, box; k = 1, tol = residual_tol)
 time_2d     = time() - time_start
 
 @printf("  N = %d,  box V0 in [%.1f, %.1f] x D in [%.1f, %.1f],  tolerance %.0e\n",
-        N_small, box[1]..., box[2]..., residual_tol)
+        N_emulator, box[1]..., box[2]..., residual_tol)
 @printf("  block %d states,  %d snapshots,  %.2f s,  certified residual %.1e\n\n",
         affine_2d.dim, length(emulator_2d.pts), time_2d, emulator_2d.res)
 
 # -----------------------------------------------------------------------------
-#  Step 8.  A surface over the plane, then a check off the snapshots.
+#  Step 8.  Draw the box as a character grid, with each snapshot marked by the
+#           order the greedy chose it.
+# -----------------------------------------------------------------------------
+n_cols, n_rows = 40, 12
+grid = fill(' ', n_rows, n_cols)
+
+for (i, point) in enumerate(emulator_2d.pts)
+    V0_point, D_point = point[1], point[2]
+
+    # map the coupling onto a cell; D runs upwards, so row 1 is the top of box
+    frac_V0 = (V0_point   - box[1][1]) / (box[1][2] - box[1][1])
+    frac_D  = (box[2][2] - D_point)    / (box[2][2] - box[2][1])
+    col = clamp(1 + round(Int, frac_V0 * (n_cols - 1)), 1, n_cols)
+    row = clamp(1 + round(Int, frac_D  * (n_rows - 1)), 1, n_rows)
+
+    label = i < 10 ? '0' + i : 'a' + (i - 10)
+    grid[row, col] = grid[row, col] == ' ' ? label : '*'   # '*' = two in one cell
+end
+
+println("  snapshots, in the order chosen (1-9, then a, b, ...; * = two in one cell):")
+println()
+@printf("  D = %.1f   +%s+\n", box[2][2], "-"^n_cols)
+for row in 1:n_rows
+    @printf("            |%s|\n", String(grid[row, :]))
+end
+@printf("  D = %.1f   +%s+\n", box[2][1], "-"^n_cols)
+
+axis_left  = @sprintf("V0 = %.1f", box[1][1])
+axis_right = @sprintf("%.1f", box[1][2])
+gap = n_cols + 2 - length(axis_left) - length(axis_right)
+@printf("            %s%s%s\n\n", axis_left, " "^max(gap, 1), axis_right)
+
+# -----------------------------------------------------------------------------
+#  Step 9.  A surface over the plane, then a check off the snapshots.
 # -----------------------------------------------------------------------------
 n_V0, n_D = 30, 30
 V0_grid   = range(box[1]...; length = n_V0)
