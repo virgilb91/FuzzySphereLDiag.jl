@@ -87,18 +87,18 @@ time_solve_L = time() - time_start
         abs(E0_m - E0_L), basis_m.dim, sector.dim,
         time_build_m + time_solve_m, time_build_L + time_solve_L)
 
-head("PART 2.  A one-dimensional emulator, and the order parameter")
+head("PART 2.  The order parameter from a one-dimensional emulator")
 
 println("""  Fix V0 and scan the field alone.  The Hamiltonian is affine in both, so the
   one-parameter operator is the two-parameter one with the V0 piece folded into
-  the constant part -- no new machinery, just a different grouping.
+  the constant part.  The same machinery serves, grouped differently.
 
   This emulator is grown against an observable rather than the energy.  The
   order parameter is m^2 = ||O|GS>||^2, with O the Z2-odd magnetization that
   maps the Z2 = +1 block onto Z2 = -1.  Assemble G = (O.Psi)'(O.Psi) from the
   snapshots and m^2 = y' G y at any field costs one reduced eigensolve.  The
   greedy stops once the largest relative change in m^2 along the scan, between
-  consecutive snapshots, falls below the tolerance below.
+  consecutive snapshots, falls below m2_tol, set in the next step.
 """)
 
 # -----------------------------------------------------------------------------
@@ -166,8 +166,8 @@ println("""  falls as the field disorders it.  The order parameter is several or
 head("PART 3.  A two-dimensional emulator over the (V0, h) plane")
 
 # -----------------------------------------------------------------------------
-#  Step 8.  Define the region of coupling space to cover, and how small the
-#           certified residual has to get before the emulator is good enough.
+#  Step 8.  Define the region of coupling space to cover, at the residual
+#           tolerance set below.
 # -----------------------------------------------------------------------------
 box = [(3.8, 5.8),      # range of V0
        (3.02, 3.32)]    # range of h
@@ -178,8 +178,8 @@ residual_tol = 1e-9     # target for the worst certified residual over the box
         box[1]..., box[2]..., residual_tol)
 
 # -----------------------------------------------------------------------------
-#  Step 9.  Ask the package for the two things the emulator needs: the affine
-#           pieces of H, and a function that solves exactly at one point.
+#  Step 9.  Ask the package for what the emulator needs: the affine pieces of
+#           H, and a function that solves exactly at one point.
 # -----------------------------------------------------------------------------
 affine, solve_exact = jscheme_ising_affine(N, L_total, z2_parity)
 
