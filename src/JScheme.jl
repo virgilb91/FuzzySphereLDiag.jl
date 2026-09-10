@@ -36,10 +36,8 @@ module JScheme
 using LinearAlgebra
 using Printf
 
-const HAVE_ARPACK = Base.find_package("Arpack") !== nothing
-@static if Base.find_package("Arpack") !== nothing
-    import Arpack
-end
+import Arpack
+const HAVE_ARPACK = true
 
 phase(n::Integer) = isodd(n) ? -1.0 : 1.0
 
@@ -212,12 +210,16 @@ mutable struct Orbit
     blocks::Dict{Int,Dict{Int,Vector{Int}}}
     hw::Dict{Int,Dict{Int,Matrix{Float64}}}
     rme_t::Dict{NTuple{4,Int},Union{Matrix{Float64},Nothing}}
-    rme_pair::Dict{NTuple{4,Int},Union{Matrix{Float64},Nothing}}
+        rme_pair::Dict{NTuple{4,Int},Union{Matrix{Float64},Nothing}}
+        rme_tt::Dict{NTuple{6,Int},Union{Matrix{Float64},Nothing}}
+    rme_ttt::Dict{NTuple{8,Int},Union{Matrix{Float64},Nothing}}
+    rme_q::Dict{NTuple{6,Int},Union{Matrix{Float64},Nothing}}
     rme_y::Dict{NTuple{4,Int},Union{Matrix{Float64},Nothing}}
     w::Dict{NTuple{3,Int},Matrix{Float64}}
 end
 
-Orbit(N) = Orbit(N, N - 1, Dict(), Dict(), Dict(), Dict(), Dict(), Dict())
+Orbit(N) = Orbit(N, N - 1, Dict(), Dict(), Dict(), Dict(), Dict(), Dict(), Dict(),
+                 Dict(), Dict())
 
 const _ORBITS = Dict{Int,Orbit}()
 orbit(N) = get!(() -> Orbit(N), _ORBITS, N)
@@ -380,6 +382,139 @@ rme_t(orb, n, two_lam, two_Jp, two_J) =
     get!(() -> stretched(orb, t_terms(orb.N, two_lam, two_Jp - two_J),
                          n, two_J, n, two_Jp, two_lam),
          orb.rme_t, (n, two_lam, two_Jp, two_J))
+
+"""A_{J0 mu}, the adjoint of `pair_create_terms`: the daggers drop and the two
+operators swap, since the list is read in operator (physics) order."""
+function pair_annih_terms(N, two_J0, two_mu)
+    [(v, [(false, ops[2][2]), (false, ops[1][2])])
+     for (v, ops) in pair_create_terms(N, two_J0, two_mu)]
+end
+
+"""Terms of the coupled two-body density tensor
+
+    W^lam_mu(J1, J2) = sum_{mu1 mu2} <J1 mu1; J2 mu2 | lam mu>
+                       A+_{J1 mu1} Atilde_{J2 mu2},
+
+with `Atilde_{J mu} = (-1)^{(J-mu)/2} A_{J,-mu}` the time-reversed pair
+annihilator.  Any two-body operator is a combination of these."""
+function two_body_terms(N, two_J1, two_J2, two_lam, two_mu)
+    out = Tuple{Float64,Vector{Tuple{Bool,Int}}}[]
+    for two_mu1 in -two_J1:2:two_J1
+        two_mu2 = two_mu - two_mu1
+        abs(two_mu2) <= two_J2 || continue
+        coefficient = cg(two_J1, two_mu1, two_J2, two_mu2, two_lam, two_mu)
+        coefficient == 0 && continue
+        weight = coefficient * phase((two_J2 - two_mu2) ÷ 2)
+        for (v1, o1) in pair_create_terms(N, two_J1, two_mu1),
+            (v2, o2) in pair_annih_terms(N, two_J2, -two_mu2)
+            push!(out, (weight * v1 * v2, vcat(o1, o2)))
+        end
+    end
+    return out
+end
+
+"""    rme_tt(orb, n, two_J1, two_J2, two_lam, two_Jp, two_J)
+
+Reduced matrix elements `<n J\' a\' || W^lam(J1,J2) || n J a>` of the two-body
+density tensor, the two-body analogue of [`rme_t`](@ref).  A three-body term
+with two of its particles in this orbit factorises through these."""
+rme_tt(orb, n, two_J1, two_J2, two_lam, two_Jp, two_J) =
+    get!(() -> stretched(orb, two_body_terms(orb.N, two_J1, two_J2, two_lam,
+                                             two_Jp - two_J),
+                         n, two_J, n, two_Jp, two_lam),
+         orb.rme_tt, (n, two_J1, two_J2, two_lam, two_Jp, two_J))
+
+"""B+_{K M}(J12): a pair coupled to `J12`, then coupled with a third particle to
+total `K`.  Three identical fermions need the intermediate `J12` as a label, so
+the family is over-complete rather than orthogonal; the channel decomposition
+must account for that.  `K` is half-integer, so `two_K` is odd."""
+function triple_create_terms(N, two_J12, two_K, two_M)
+    two_j = N - 1
+    out = Tuple{Float64,Vector{Tuple{Bool,Int}}}[]
+    for two_mu in -two_J12:2:two_J12
+        two_m = two_M - two_mu
+        k = (two_m + two_j) ÷ 2
+        (0 <= k < N && iseven(two_m + two_j)) || continue
+        coefficient = cg(two_J12, two_mu, two_j, two_m, two_K, two_M)
+        coefficient == 0 && continue
+        for (v, ops) in pair_create_terms(N, two_J12, two_mu)
+            push!(out, (coefficient * v, vcat(ops, [(true, k)])))
+        end
+    end
+    return out
+end
+
+"""B_{K M}(J12), the adjoint of [`triple_create_terms`](@ref)."""
+triple_annih_terms(N, two_J12, two_K, two_M) =
+    [(v, reverse([(!dagger, k) for (dagger, k) in ops]))
+     for (v, ops) in triple_create_terms(N, two_J12, two_K, two_M)]
+
+"""Terms of the coupled three-body density tensor
+
+    V^lam_mu(K1,J12a; K2,J12b) = sum_{M1 M2} <K1 M1; K2 M2 | lam mu>
+                                 B+_{K1 M1}(J12a) Btilde_{K2 M2}(J12b).
+
+Because `K` is half-integer here, the scalar case carries an extra `(-1)^{2K}`
+relative to the two-body one: summing `(-1)^{2K} sqrt(2K+1) V^0_0(K,J12)` over
+`K` gives `(n-2)` times the pair count in channel `J12`."""
+function three_body_terms(N, two_J12a, two_K1, two_J12b, two_K2, two_lam, two_mu)
+    out = Tuple{Float64,Vector{Tuple{Bool,Int}}}[]
+    for two_M1 in -two_K1:2:two_K1
+        two_M2 = two_mu - two_M1
+        abs(two_M2) <= two_K2 || continue
+        coefficient = cg(two_K1, two_M1, two_K2, two_M2, two_lam, two_mu)
+        coefficient == 0 && continue
+        weight = coefficient * phase((two_K2 - two_M2) ÷ 2)
+        for (v1, o1) in triple_create_terms(N, two_J12a, two_K1, two_M1),
+            (v2, o2) in triple_annih_terms(N, two_J12b, two_K2, -two_M2)
+            push!(out, (weight * v1 * v2, vcat(o1, o2)))
+        end
+    end
+    return out
+end
+
+"""    rme_ttt(orb, n, two_J12a, two_K1, two_J12b, two_K2, two_lam, two_Jp, two_J)
+
+Reduced matrix elements of the three-body density tensor within one orbit, the
+three-body analogue of [`rme_t`](@ref) and [`rme_tt`](@ref).  A three-body term
+with all three particles in this orbit factorises through these."""
+rme_ttt(orb, n, two_J12a, two_K1, two_J12b, two_K2, two_lam, two_Jp, two_J) =
+    get!(() -> stretched(orb,
+                         three_body_terms(orb.N, two_J12a, two_K1, two_J12b,
+                                          two_K2, two_lam, two_Jp - two_J),
+                         n, two_J, n, two_Jp, two_lam),
+         orb.rme_ttt,
+         (n, two_J12a, two_K1, two_J12b, two_K2, two_lam, two_Jp, two_J))
+
+"""Terms of `Q^lam_mu(K,J12) = [B+^K(J12) x ctilde]^lam`: three creations and one
+annihilation, so it raises the orbit occupancy by two.  This is the per-orbit
+factor of a three-body term that moves particles between the two orbits."""
+function quad_terms(N, two_J12, two_K, two_lam, two_mu)
+    two_j = N - 1
+    out = Tuple{Float64,Vector{Tuple{Bool,Int}}}[]
+    for two_M in -two_K:2:two_K
+        two_m = two_M - two_mu
+        k = (two_m + two_j) ÷ 2
+        (0 <= k < N && iseven(two_m + two_j)) || continue
+        coefficient = cg(two_K, two_M, two_j, -two_m, two_lam, two_mu)
+        coefficient == 0 && continue
+        weight = coefficient * phase((two_j + two_m) ÷ 2)
+        for (v, ops) in triple_create_terms(N, two_J12, two_K, two_M)
+            push!(out, (weight * v, vcat(ops, [(false, k)])))
+        end
+    end
+    return out
+end
+
+"""    rme_q(orb, n_top, two_J12, two_K, two_lam, two_Jp, two_J)
+
+Reduced matrix elements of [`quad_terms`](@ref) between `n_top - 2` and `n_top`
+particles, the occupancy-raising partner of [`rme_pair`](@ref)."""
+rme_q(orb, n_top, two_J12, two_K, two_lam, two_Jp, two_J) =
+    get!(() -> stretched(orb, quad_terms(orb.N, two_J12, two_K, two_lam,
+                                         two_Jp - two_J),
+                         n_top - 2, two_J, n_top, two_Jp, two_lam),
+         orb.rme_q, (n_top, two_J12, two_K, two_lam, two_Jp, two_J))
 
 rme_pair(orb, n_top, two_J0, two_Jp, two_J) =
     get!(() -> stretched(orb, pair_create_terms(orb.N, two_J0,
@@ -939,6 +1074,257 @@ function workspace(sector::Sector)
     end
     return ([zeros(sector.dim) for _ in 1:nthreads],
             [zeros(max_tmp) for _ in 1:nthreads], ranges)
+end
+
+"""
+    add_three_body!(sector, two_J12a, two_K1, two_J12b, two_K2, weight; parity)
+
+Add `weight * V^0(K1,J12a; K2,J12b)` acting inside a single orbit to `sector`,
+as extra tasks in the factorised matvec.  `parity` is `:plus` or `:minus`, naming the orbit in the sigma^x basis.
+
+This is the channel of a three-body term with all three particles in one orbit.
+Being a scalar it is diagonal in both `J_+` and `J_-`, so the other orbit
+contributes only the identity and the recoupling reduces to
+[`scalar_coef`](@ref) at rank zero.
+
+Validated against a direct m-scheme diagonalization of the same term list.
+"""
+function add_three_body!(sector::Sector, two_J12a, two_K1, two_J12b, two_K2,
+                         weight; parity::Symbol = :plus)
+    parity in (:plus, :minus) || error("parity must be :plus or :minus")
+    N = sector.N; orb = orbit(N)
+    for channel in sector.channels
+        n_minus, two_Jp, two_Jm, mult_plus, mult_minus = channel
+        n_here = parity === :plus ? N - n_minus : n_minus
+        two_J_here = parity === :plus ? two_Jp : two_Jm
+        reduced = rme_ttt(orb, n_here, two_J12a, two_K1, two_J12b, two_K2, 0,
+                          two_J_here, two_J_here)
+        reduced === nothing && continue
+        # the spectator orbit contributes <J||1||J> = sqrt(2J+1)
+        spectator = parity === :plus ? two_Jm : two_Jp
+        coefficient = weight *
+            scalar_coef(two_Jp, two_Jm, two_Jp, two_Jm, 2 * sector.L, 0) *
+            sqrt(spectator + 1.0)
+        maximum(abs, reduced) * abs(coefficient) < 1e-14 && continue
+        offset = sector.offset[(n_minus, two_Jp, two_Jm)]
+        rp = parity === :plus ? reduced : Matrix{Float64}(I, mult_plus, mult_plus)
+        rm = parity === :plus ? Matrix{Float64}(I, mult_minus, mult_minus) : reduced
+        push!(sector.tasks, Task(offset, offset, coefficient, rp, rm))
+    end
+    return sector
+end
+
+"""
+    add_three_body_mixed!(sector, two_J1, two_J2, two_lam, weight; pair)
+
+Add the mixed channel of a three-body term: two of its particles in one orbit,
+the third in the other, coupled to a scalar.  `pair` is `:plus` or `:minus` and
+says which orbit holds the pair.
+
+The operator is `sum_q (-1)^q W^lam_q(pair orbit) T^lam_{-q}(other orbit)`, a
+rank-`lam` two-body tensor against a rank-`lam` one-body tensor.  That is the
+same shape as the two-body Hamiltonian, so it needs no new recoupling: the
+existing [`scalar_coef`](@ref) applies, with [`rme_tt`](@ref) replacing one of
+the one-body factors.  Unlike the single-orbit channel it connects different
+`J_+` and `J_-`, so the tasks run between channels.
+"""
+function add_three_body_mixed!(sector::Sector, two_J1, two_J2, two_lam, weight;
+                               pair::Symbol = :plus)
+    pair in (:plus, :minus) || error("pair must be :plus or :minus")
+    N = sector.N; orb = orbit(N)
+    for out_channel in sector.channels, in_channel in sector.channels
+        n_minus, Jp_out, Jm_out, _, _ = out_channel
+        n_minus_in, Jp_in, Jm_in, _, _ = in_channel
+        n_minus == n_minus_in || continue          # this channel conserves both counts
+        n_plus = N - n_minus
+        if pair === :plus
+            rp = rme_tt(orb, n_plus, two_J1, two_J2, two_lam, Jp_out, Jp_in)
+            rm = rme_t(orb, n_minus, two_lam, Jm_out, Jm_in)
+        else
+            rp = rme_t(orb, n_plus, two_lam, Jp_out, Jp_in)
+            rm = rme_tt(orb, n_minus, two_J1, two_J2, two_lam, Jm_out, Jm_in)
+        end
+        (rp === nothing || rm === nothing) && continue
+        coefficient = weight * scalar_coef(Jp_out, Jm_out, Jp_in, Jm_in,
+                                           2 * sector.L, two_lam)
+        abs(coefficient) * maximum(abs, rp) * maximum(abs, rm) < 1e-14 && continue
+        push!(sector.tasks, Task(sector.offset[out_channel[1:3]],
+                                 sector.offset[in_channel[1:3]],
+                                 coefficient, rp, rm))
+    end
+    return sector
+end
+
+"""
+    add_three_body_hop!(sector, two_J12, two_K, two_lam, weight)
+
+Add the occupancy-changing channel of a three-body term: three creations and one
+annihilation in the `+` orbit against a pair annihilation in the `-` orbit, and
+the hermitian conjugate.  The Ising parity `(-1)^{n_-}` is preserved because the
+occupancies move by two.
+
+The two factors are both rank `lam`, so [`scalar_coef`](@ref) again supplies the
+recoupling.  Unlike the same-flavour pair hop, which carries an extra fitted
+factor, this channel needs no cross-flavour constant: fitting one against an
+m-scheme expectation value returns 1 to nine digits.
+"""
+function add_three_body_hop!(sector::Sector, two_J12, two_K, two_lam, weight;
+                             single::Symbol = :plus)
+    single in (:plus, :minus) || error("single must be :plus or :minus")
+    N = sector.N; orb = orbit(N)
+    by_n = Dict{Int,Vector{NTuple{5,Int}}}()
+    for channel in sector.channels
+        push!(get!(() -> NTuple{5,Int}[], by_n, channel[1]), channel)
+    end
+    for in_channel in sector.channels
+        n_minus, Jp_in, Jm_in, _, _ = in_channel
+        n_plus = N - n_minus
+        shift = single === :plus ? -2 : 2
+        for out_channel in get(by_n, n_minus + shift, NTuple{5,Int}[])
+            _, Jp_out, Jm_out, _, _ = out_channel
+            # the one-body factor rides with the orbit named by `single`; the
+            # other orbit contributes a bare pair.
+            rp, rm = single === :plus ?
+                (rme_q(orb, n_plus + 2, two_J12, two_K, two_lam, Jp_out, Jp_in),
+                 rme_y(orb, n_minus, two_lam, Jm_out, Jm_in)) :
+                (rme_y(orb, n_plus, two_lam, Jp_out, Jp_in),
+                 rme_q(orb, n_minus + 2, two_J12, two_K, two_lam, Jm_out, Jm_in))
+            (rp === nothing || rm === nothing) && continue
+            coefficient = weight * scalar_coef(Jp_out, Jm_out, Jp_in, Jm_in,
+                                               2 * sector.L, two_lam)
+            abs(coefficient) * maximum(abs, rp) * maximum(abs, rm) < 1e-14 && continue
+            out_off = sector.offset[out_channel[1:3]]
+            in_off  = sector.offset[in_channel[1:3]]
+            push!(sector.tasks, Task(out_off, in_off, coefficient, rp, rm))
+            # the hermitian conjugate, so the added term is symmetric
+            push!(sector.tasks, Task(in_off, out_off, coefficient,
+                                     Matrix(rp'), Matrix(rm')))
+        end
+    end
+    return sector
+end
+
+"""
+    three_body_channels(N; lam_max = 8)
+
+Enumerate the invariant three-body channels this solver can add, as
+`(kind, (a, b, c))` tuples.  `kind` is one of
+
+  * `:plus`, `:minus` -- all three particles in that orbit, `(2J12, 2K, 0)`
+  * `:mixp`, `:mixm`  -- a pair in that orbit and one in the other, `(2J1, 2J2, 2lam)`
+  * `:hop`, `:hopm`   -- a pair moved between orbits with the remaining one-body
+                        factor on the `+` (`:hop`) or `-` (`:hopm`) orbit,
+                        `(2J12, 2K, 2lam)`
+
+Every entry is Hermitian, so any weighted sum is a legal Hamiltonian term.  The
+family is over-complete: many entries give the zero operator, and those that do
+not are still linearly dependent, so a decomposition onto them wants a
+least-squares solve ([`decompose_three_body`](@ref)) rather than an exact
+inversion.  It is also complete -- with `lam_max = 2(N-1)` the nonzero entries
+span every Hermitian `SO(3)`-invariant three-body operator that preserves
+`(-1)^n_-`, 56 of them at `N = 6` and 126 at `N = 8`.
+"""
+function three_body_channels(N; lam_max = 8)
+    two_j = N - 1
+    out = Tuple{Symbol,NTuple{3,Int}}[]
+    for two_J12 in 0:2:(2two_j), two_K in abs(two_J12 - two_j):2:(two_J12 + two_j)
+        push!(out, (:plus, (two_J12, two_K, 0)))
+        push!(out, (:minus, (two_J12, two_K, 0)))
+        for two_lam in 0:2:min(2two_j, lam_max)
+            push!(out, (:hop, (two_J12, two_K, two_lam)))
+            push!(out, (:hopm, (two_J12, two_K, two_lam)))
+        end
+    end
+    for two_J1 in 0:2:(2two_j), two_J2 in two_J1:2:(2two_j),
+        two_lam in abs(two_J1 - two_J2):2:min(two_J1 + two_J2, lam_max)
+        push!(out, (:mixp, (two_J1, two_J2, two_lam)))
+        push!(out, (:mixm, (two_J1, two_J2, two_lam)))
+    end
+    return out
+end
+
+"""
+    add_channel!(sector, channel, weight)
+
+Add one entry of [`three_body_channels`](@ref) to `sector`, dispatching to
+[`add_three_body!`](@ref), [`add_three_body_mixed!`](@ref) or
+[`add_three_body_hop!`](@ref).
+"""
+function add_channel!(sector::Sector, channel, weight)
+    kind, (a, b, c) = channel
+    kind === :plus  && return add_three_body!(sector, a, b, a, b, weight; parity = :plus)
+    kind === :minus && return add_three_body!(sector, a, b, a, b, weight; parity = :minus)
+    if kind === :mixp || kind === :mixm
+        # W^lam(J1, J2) is not Hermitian unless J1 == J2, so pair it with
+        # W^lam(J2, J1); every channel is then usable in a Hamiltonian as it is.
+        pair = kind === :mixp ? :plus : :minus
+        w = a == b ? weight : weight / 2
+        add_three_body_mixed!(sector, a, b, c, w; pair = pair)
+        a == b || add_three_body_mixed!(sector, b, a, c, w; pair = pair)
+        return sector
+    end
+    kind === :hop   && return add_three_body_hop!(sector, a, b, c, weight; single = :plus)
+    kind === :hopm  && return add_three_body_hop!(sector, a, b, c, weight; single = :minus)
+    error("unknown three-body channel kind $kind")
+end
+
+"""
+    channel_design(N, specs; lam_max = 8, tol = 1e-9)
+
+Evaluate every entry of [`three_body_channels`](@ref) on the sectors named by
+`specs`, a list of `(L, z2)` pairs, and return `(channels, A)`.  The sectors are
+built with all couplings zero, so each channel's matrix is what the channel adds
+and nothing else; column `k` of `A` is channel `k` flattened and stacked over the
+sectors.  Channels whose operator vanishes on every listed sector are dropped
+from both the list and the matrix.
+
+`A` is rank-deficient -- the channel labels outnumber the operators they produce
+-- so use [`decompose_three_body`](@ref) rather than a direct solve.
+"""
+function channel_design(N, specs; lam_max = 8, tol = 1e-9)
+    chans = three_body_channels(N; lam_max = lam_max)
+    sectors = [Sector(N, 0.0, 0.0, 0.0, L, z2) for (L, z2) in specs]
+    marks = [length(s.tasks) for s in sectors]
+    rows = sum(s.dim^2 for s in sectors)
+    columns = Vector{Float64}[]
+    kept = eltype(chans)[]
+    for channel in chans
+        column = Vector{Float64}(undef, rows)
+        at = 0
+        for (s, mark) in zip(sectors, marks)
+            add_channel!(s, channel, 1.0)
+            block = dense(s)
+            resize!(s.tasks, mark)                 # restore the empty sector
+            column[at+1:at+length(block)] .= vec(block)
+            at += length(block)
+        end
+        if maximum(abs, column) > tol
+            push!(columns, column)
+            push!(kept, channel)
+        end
+    end
+    return kept, isempty(columns) ? zeros(rows, 0) : reduce(hcat, columns)
+end
+
+"""
+    decompose_three_body(A, target; rtol = 1e-8)
+
+Least-squares weights for `target` over the channel columns of `A`, returned as
+`(weights, residual)` with `residual` the relative norm of what is left over.
+
+The channel family is linearly dependent, so the weights are not unique; this
+returns the minimum-norm solution, obtained by dropping singular values below
+`rtol` times the largest.  A residual near machine precision says the target is
+a combination of the channels, and the reconstruction `A * weights` is then
+well defined even though the weights themselves are one representative of a
+family.
+"""
+function decompose_three_body(A, target::AbstractVector; rtol = 1e-8)
+    F = svd(A)
+    keep = F.S .> rtol * (isempty(F.S) ? 1.0 : F.S[1])
+    weights = F.V[:, keep] * ((F.U[:, keep]' * target) ./ F.S[keep])
+    residual = norm(A * weights .- target) / max(norm(target), eps())
+    return weights, residual
 end
 
 function dense(sector::Sector)
