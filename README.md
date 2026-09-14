@@ -166,8 +166,8 @@ while an expectation value is first order.
 One per model, each self-contained:
 
 ```
-julia -t 4 examples/tutorial_ising.jl   # well under a minute
-julia -t 4 examples/tutorial_o2.jl      # its middle part dominates the runtime
+julia -t 4 examples/tutorial_ising.jl   
+julia -t 4 examples/tutorial_o2.jl      
 ```
 
 Both need FuzzySphereLDiag and FuzzifiED in the active environment. Each is a
@@ -189,11 +189,8 @@ Every figure quoted in the text is computed by the run.
 
 `tutorial_o2.jl`
 
-1. The O(2) ground state both ways, demonstrating the `kappa/2` shift. Omitting
-   it makes the two codes disagree in the first digit.
-2. The same run at a larger `N`, where the coupled basis overtakes the m-scheme
-   one; the growth rates and the crossover are computed from the two runs.
-3. A one-parameter emulator at fixed `V0`, grown against `m^2`, giving the
+1. The O(2) ground state both ways, demonstrating the `kappa/2` shift.
+2. A one-parameter emulator at fixed `V0`, grown against `m^2`, giving the
    anisotropy cut of Fig. 5 of the O(2) paper.
 4. A two-parameter emulator over the `(V0, D)` plane, on the energy alone.
 
