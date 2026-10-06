@@ -2,25 +2,9 @@
     JScheme
 
 Exact diagonalisation of the fuzzy-sphere Ising model in the J-scheme --
-a Julia port of `jscheme.py` from this package, written so it could be
-contributed to FuzzifiED (https://docs.fuzzified.world) as an exact-L
-alternative to its m-scheme ED at moderate and large N.
-
+an exact-L alternative to its m-scheme ED at moderate and large N.
 The basis is |[(n_+, J_+, a_+) x (n_-, J_-, a_-)] L>: good total angular
-momentum L by construction and exact Z2 = (-1)^{n_-}.  Every two-body term
-factorises NuShellX-style (Brown & Rae, NDS 120, 115 (2014)) into per-orbit
-reduced matrix elements tied by a 6j, so the Lanczos matvec is a sum of small
-dense products -- which in Julia is a plain threaded loop: the shape-batching
-and embedded C kernel that the Python version needs to escape its interpreter
-have no reason to exist here.
-
-House rule carried over: no hand-derived phase is trusted.  The Pandya and
-pair-hopping coefficients are projected numerically from the m-scheme tensors
-with the residual asserted, and the scalar-product 6j formula ships with the
-numeric verifier that fitted it (`verify_scalar_formula`), run in `validate()`.
-The end-to-end check is 30 reference energies measured independently with an
-independent Python implementation (exact ED at N <= 8) and with FuzzifiED --
-both agree with this solver to every printed digit.
+momentum L by construction and exact Z2 = (-1)^{n_-}
 
 Dependencies: LinearAlgebra (stdlib) and Arpack for the
 iterative eigensolver (dense fallback below `dense_limit`).
@@ -35,9 +19,12 @@ module JScheme
 
 using LinearAlgebra
 using Printf
+import SparseArrays
 
-import Arpack
-const HAVE_ARPACK = true
+const HAVE_ARPACK = Base.find_package("Arpack") !== nothing
+@static if Base.find_package("Arpack") !== nothing
+    import Arpack
+end
 
 phase(n::Integer) = isodd(n) ? -1.0 : 1.0
 
@@ -83,38 +70,29 @@ function wigner3j(j1, j2, j3, m1, m2, m3)
     return prefactor * total
 end
 
-# Wigner-symbol caching under threads: a shared cache that is READ-ONLY while
-# threads run, plus one overflow cache per thread for keys not yet shared.
-# After a threaded build, merge_wigner_caches!() folds the overflows into the
-# shared caches (single-threaded), so later sectors hit them without duplicate
-# work.  A plain shared Dict with get! is NOT usable here -- concurrent writes
-# corrupt it during rehash.
-const _CG_SHARED = Dict{NTuple{6,Int},Float64}()
-const _CG_CACHES = [Dict{NTuple{6,Int},Float64}()
-                    for _ in 1:Threads.maxthreadid()+8]
-const _SIXJ_SHARED = Dict{NTuple{6,Int},Float64}()
-const _SIXJ_CACHES = [Dict{NTuple{6,Int},Float64}()
-                      for _ in 1:Threads.maxthreadid()+8]
+const _CG_CACHE = Dict{NTuple{6,Int},Float64}()
 
 function cg(j1, m1, j2, m2, J, M)
     m1 + m2 != M && return 0.0
     key = (j1, m1, j2, m2, J, M)
-    shared = get(_CG_SHARED, key, NaN)
-    isnan(shared) || return shared
-    cache = _CG_CACHES[Threads.threadid()]
-    haskey(cache, key) && return cache[key]
-    return cache[key] = phase((j1 - j2 + M) ÷ 2) * sqrt(J + 1.0) *
-                        wigner3j(j1, j2, J, m1, m2, -M)
+    get!(_CG_CACHE, key) do
+        phase((j1 - j2 + M) ÷ 2) * sqrt(J + 1.0) *
+            wigner3j(j1, j2, J, m1, m2, -M)
+    end
 end
 
-function merge_wigner_caches!()
-    for c in _SIXJ_CACHES
+# 6j caching under threads: a shared cache that is READ-ONLY while threads
+# run, plus one overflow cache per thread for keys not yet shared.  After a
+# threaded build, merge_sixj_caches!() folds the overflows into the shared
+# cache (single-threaded), so later sectors hit it without duplicate work.
+const _SIXJ_SHARED = Dict{NTuple{6,Int},Float64}()
+const _SIXJ_CACHES = [Dict{NTuple{6,Int},Float64}()
+                      for _ in 1:Threads.maxthreadid()+8]
+
+function merge_sixj_caches!()
+    for (i, c) in enumerate(_SIXJ_CACHES)
         merge!(_SIXJ_SHARED, c)
-        empty!(c)
-    end
-    for c in _CG_CACHES
-        merge!(_CG_SHARED, c)
-        empty!(c)
+        _SIXJ_CACHES[i] = Dict{NTuple{6,Int},Float64}()   # empty! would keep the capacity
     end
 end
 
@@ -139,8 +117,10 @@ function _sixj_canonical(j1, j2, j3, j4, j5, j6)
     return best
 end
 
-"""Racah 6j in exact rational arithmetic; the alternating sum cancels
-catastrophically in floating point at the j ~ 15 this file cares about."""
+"""Racah 6j, memoised under the 24 symmetries.  The alternating sum can cancel
+catastrophically in floating point at the j this file needs, so
+`_sixj_compute` measures the cancellation and falls back to exact integer
+arithmetic when it matters."""
 function sixj(a1, a2, a3, a4, a5, a6)
     key = _sixj_canonical(a1, a2, a3, a4, a5, a6)
     shared = get(_SIXJ_SHARED, key, NaN)
@@ -150,7 +130,76 @@ function sixj(a1, a2, a3, a4, a5, a6)
     return _SIXJ_CACHE[key] = _sixj_compute(key...)
 end
 
+"""Racah sum without factorials.  Consecutive terms
+    term(t) = (-1)^t (t+1)! / [prod (t - low)! prod (high - t)!]
+have the ratio  r_t = -(t+2) prod(high - t) / prod(t+1 - low)  of small integers, so
+    sum_t term(t) = term(tmin) [1 + r_tmin (1 + r_tmin+1 (1 + ...))],
+with term(tmin) and the triangle prefactor from log-factorials.  The bracket is
+evaluated in Float64 together with the same recursion on |r_t|, whose ratio to
+the result bounds the cancellation; when that bound times the number of terms
+exceeds 1e3 the bracket is recomputed exactly as one BigInt fraction (BigInt x
+Int products only).  Against the exact Rational{BigInt} form
+(`_sixj_compute_rational`, kept as the reference) the difference is at most
+4e-15 absolute for 2j <= 120, and it is 35-55x faster; the rational form had
+taken 90% of the first O(2) build at N = 12 (973k distinct symbols)."""
 function _sixj_compute(j1, j2, j3, j4, j5, j6)
+    triangles = ((j1, j2, j3), (j1, j5, j6), (j4, j2, j6), (j4, j5, j3))
+    for (a, b, c) in triangles
+        if isodd(a + b + c) || c > a + b || c < abs(a - b)
+            return 0.0
+        end
+    end
+    log_prefactor = 0.0
+    for (a, b, c) in triangles
+        log_prefactor += 0.5 * (logfact((a + b - c) ÷ 2) +
+                                logfact((a - b + c) ÷ 2) +
+                                logfact((-a + b + c) ÷ 2) -
+                                logfact((a + b + c) ÷ 2 + 1))
+    end
+    lows = ((j1 + j2 + j3) ÷ 2, (j1 + j5 + j6) ÷ 2,
+            (j4 + j2 + j6) ÷ 2, (j4 + j5 + j3) ÷ 2)
+    highs = ((j1 + j2 + j4 + j5) ÷ 2, (j2 + j3 + j5 + j6) ÷ 2,
+             (j3 + j1 + j6 + j4) ÷ 2)
+    tmin, tmax = maximum(lows), minimum(highs)
+    tmin > tmax && return 0.0
+    log_term = logfact(tmin + 1) - sum(logfact(tmin - l) for l in lows) -
+               sum(logfact(h - tmin) for h in highs)
+    sgn = isodd(tmin) ? -1.0 : 1.0
+    # Float64 Horner, with the cancellation factor sum|terms| / |sum| alongside;
+    # its rounding error is ~ (terms x factor) eps, accepted below 1e3 eps
+    # (the exp of the log-factorials already carries ~1e-13)
+    v, va = 1.0, 1.0
+    for t in tmax-1:-1:tmin
+        a = -(t + 2) * (highs[1] - t) * (highs[2] - t) * (highs[3] - t)
+        b = (t + 1 - lows[1]) * (t + 1 - lows[2]) * (t + 1 - lows[3]) *
+            (t + 1 - lows[4])
+        r = a / b
+        v = 1.0 + r * v
+        va = 1.0 + abs(r) * va
+    end
+    if va * (tmax - tmin + 1) < 1e3 * abs(v)
+        return sgn * sign(v) * exp(log_prefactor + log_term + log(abs(v)))
+    end
+    num, den = big(1), big(1)                    # exact: BigInt x Int only
+    for t in tmax-1:-1:tmin
+        a = -(t + 2) * (highs[1] - t) * (highs[2] - t) * (highs[3] - t)
+        b = (t + 1 - lows[1]) * (t + 1 - lows[2]) * (t + 1 - lows[3]) *
+            (t + 1 - lows[4])
+        num = den * b + num * a
+        den = den * b
+    end
+    iszero(num) && return 0.0
+    return sgn * sign(num) * sign(den) *
+           exp(log_prefactor + log_term + _logabs(num) - _logabs(den))
+end
+
+"log|x| of a BigInt through a 62-bit Float64 mantissa (no BigFloat)."
+function _logabs(x::BigInt)
+    s = max(0, ndigits(x; base = 2) - 62)
+    return log(Float64(abs(x) >> s)) + s * log(2.0)
+end
+
+function _sixj_compute_rational(j1, j2, j3, j4, j5, j6)
     triangles = ((j1, j2, j3), (j1, j5, j6), (j4, j2, j6), (j4, j5, j3))
     for (a, b, c) in triangles
         if isodd(a + b + c) || c > a + b || c < abs(a - b)
@@ -210,19 +259,169 @@ mutable struct Orbit
     blocks::Dict{Int,Dict{Int,Vector{Int}}}
     hw::Dict{Int,Dict{Int,Matrix{Float64}}}
     rme_t::Dict{NTuple{4,Int},Union{Matrix{Float64},Nothing}}
-        rme_pair::Dict{NTuple{4,Int},Union{Matrix{Float64},Nothing}}
-        rme_tt::Dict{NTuple{6,Int},Union{Matrix{Float64},Nothing}}
-    rme_ttt::Dict{NTuple{8,Int},Union{Matrix{Float64},Nothing}}
-    rme_q::Dict{NTuple{6,Int},Union{Matrix{Float64},Nothing}}
+    rme_pair::Dict{NTuple{4,Int},Union{Matrix{Float64},Nothing}}
     rme_y::Dict{NTuple{4,Int},Union{Matrix{Float64},Nothing}}
     w::Dict{NTuple{3,Int},Matrix{Float64}}
+    ph::Dict{NTuple{2,Int},Tuple{Vector{Int},Vector{Int}}}
 end
 
-Orbit(N) = Orbit(N, N - 1, Dict(), Dict(), Dict(), Dict(), Dict(), Dict(), Dict(),
-                 Dict(), Dict())
+Orbit(N) = Orbit(N, N - 1, Dict(), Dict(), Dict(), Dict(), Dict(), Dict(),
+                 Dict())
 
 const _ORBITS = Dict{Int,Orbit}()
-orbit(N) = get!(() -> Orbit(N), _ORBITS, N)
+
+"""The single-tower tables for N orbitals, loaded from the disk cache when one
+is enabled and holds them (see `enable_cache!`)."""
+function orbit(N)
+    get!(_ORBITS, N) do
+        orb = Orbit(N)
+        CACHE_DIR[] === nothing || load_tables!(orb)
+        orb
+    end
+end
+
+# -----------------------------------------------------------------------------
+# Disk cache of the coupling-independent tables
+#
+# Everything a sector build computes before it assembles tasks depends on N
+# alone: the highest-weight bases, the reduced matrix elements, the pair
+# scalars, the particle-hole maps and the 6j symbols.  At N = 17-18 these take
+# 7-17 s, against 0.05-0.4 s for the assembly, and load from disk in well under
+# a second.  One file per N plus one 6j file; opt-in, off by default.
+#
+# The bases come from SVD nullspaces, which may pick a different (equally
+# valid) basis on another run, and every reduced matrix element refers to the
+# basis it was computed in.  A small sidecar file holds a fingerprint of the
+# bases; a session that loaded a file keeps using its bases, and writes back
+# only if the file on disk still has the same fingerprint.  Files written by
+# other code versions or Julia versions are ignored (`_CACHE_TAG`).
+# -----------------------------------------------------------------------------
+
+import Serialization
+
+const CACHE_DIR = Ref{Union{Nothing,String}}(nothing)
+const _CACHE_TAG = string("JScheme-tables-v2 julia-", VERSION, " src-",
+    string(hash(read(joinpath(@__DIR__, "JScheme.jl"), String),
+                hash(read(joinpath(@__DIR__, "O2Scheme.jl"), String))); base = 16))
+const _SAVED = Dict{Int,Int}()           # N => table count at last load/save
+const _SIXJ_LOADED = Ref(false)
+
+"""    enable_cache!(dir = ~/.cache/FuzzySphereLDiag)
+
+Keep the coupling-independent tables of every N on disk, so that later
+sessions build sectors without recomputing them.  Also enabled at load time by
+the environment variable `FUZZYSPHERELDIAG_CACHE=dir`.  A file takes about
+0.3 GB at N = 17 and 0.6 GB at N = 18."""
+function enable_cache!(dir::AbstractString = joinpath(homedir(), ".cache",
+                                                      "FuzzySphereLDiag"))
+    mkpath(dir)
+    CACHE_DIR[] = abspath(dir)
+    for orb in values(_ORBITS)         # tables already in memory keep their bases
+        load_tables!(orb)
+    end
+    return CACHE_DIR[]
+end
+
+disable_cache!() = (CACHE_DIR[] = nothing; nothing)
+
+function __init__()
+    dir = get(ENV, "FUZZYSPHERELDIAG_CACHE", "")
+    isempty(dir) || enable_cache!(dir)
+end
+
+_table_file(N) = joinpath(CACHE_DIR[], "tables_N$(N).jls")
+_print_file(N) = joinpath(CACHE_DIR[], "tables_N$(N).fingerprint")
+_sixj_file() = joinpath(CACHE_DIR[], "sixj.jls")
+_table_count(orb::Orbit) = length(orb.hw) + length(orb.rme_t) +
+    length(orb.rme_pair) + length(orb.rme_y) + length(orb.w) + length(orb.ph)
+
+function _fingerprint(hw_tables)
+    h = hash(:hw)
+    for n in sort(collect(keys(hw_tables)))
+        for (two_J, m) in sort(collect(hw_tables[n]); by = first)
+            h = hash((n, two_J, size(m)), hash(m, h))
+        end
+    end
+    return h
+end
+
+function _read_cache(file)
+    isfile(file) || return nothing
+    data = try
+        open(Serialization.deserialize, file)
+    catch err
+        @warn "ignoring unreadable cache file" file exception = err
+        return nothing
+    end
+    (data isa NamedTuple && get(data, :tag, "") == _CACHE_TAG) || return nothing
+    return data
+end
+
+function _write_cache(file, data)
+    tmp = file * ".tmp." * string(getpid())
+    open(io -> Serialization.serialize(io, data), tmp, "w")
+    mv(tmp, file; force = true)                # atomic on one filesystem
+end
+
+"""Fill an empty `Orbit` from the cache.  An orbit that already holds bases
+is left alone: its matrix elements refer to them."""
+function load_tables!(orb::Orbit)
+    _load_sixj!()
+    isempty(orb.hw) || return false
+    data = _read_cache(_table_file(orb.N))
+    (data === nothing || data.N != orb.N) && return false
+    merge!(orb.hw, data.hw)
+    merge!(orb.rme_t, data.rme_t)
+    merge!(orb.rme_pair, data.rme_pair)
+    merge!(orb.rme_y, data.rme_y)
+    merge!(orb.w, data.w)
+    merge!(orb.ph, data.ph)
+    _SAVED[orb.N] = _table_count(orb)
+    return true
+end
+
+function _load_sixj!()
+    _SIXJ_LOADED[] && return
+    _SIXJ_LOADED[] = true
+    data = _read_cache(_sixj_file())
+    data === nothing || merge!(_SIXJ_SHARED, data.sixj)
+end
+
+"""Write the tables of N to the cache if the session added any.  Called at
+the end of every sector build when the cache is enabled; single-threaded."""
+function save_tables(N)
+    CACHE_DIR[] === nothing && return false
+    orb = orbit(N)
+    count = _table_count(orb)
+    get(_SAVED, N, -1) == count && return false
+    mine = string(_CACHE_TAG, " ", _fingerprint(orb.hw))
+    theirs = isfile(_print_file(N)) ? read(_print_file(N), String) : ""
+    if isfile(_table_file(N)) && startswith(theirs, _CACHE_TAG) && theirs != mine
+        # another session wrote tables in different bases first: keep theirs
+        return false
+    end
+    _write_cache(_table_file(N), (tag = _CACHE_TAG, N = N, hw = orb.hw,
+        rme_t = orb.rme_t, rme_pair = orb.rme_pair, rme_y = orb.rme_y,
+        w = orb.w, ph = orb.ph))
+    tmp = _print_file(N) * ".tmp." * string(getpid())
+    write(tmp, mine)
+    mv(tmp, _print_file(N); force = true)
+    merge_sixj_caches!()
+    sixj = _read_cache(_sixj_file())           # 6j values do not depend on bases
+    sixj === nothing || merge!(_SIXJ_SHARED, sixj.sixj)
+    _write_cache(_sixj_file(), (tag = _CACHE_TAG, sixj = _SIXJ_SHARED))
+    _SAVED[N] = count
+    return true
+end
+
+"""Forget every in-memory table (orbits, 6j, CG, Pandya); for tests and timing."""
+function reset_tables!()
+    empty!(_ORBITS); empty!(_SAVED); empty!(_SIXJ_SHARED)
+    foreach(empty!, _SIXJ_CACHES); empty!(_CG_CACHE)
+    empty!(_PANDYA); empty!(_PAIRHOP)
+    _SIXJ_LOADED[] = false
+    return nothing
+end
 
 """{two_M => sorted bitmasks} for n particles, by Gosper enumeration."""
 function blocks(orb::Orbit, n::Int)
@@ -255,42 +454,118 @@ end
 
 block_dim(orb, n, two_M) = length(get(blocks(orb, n), two_M, Int[]))
 
+"""An operator (sum of fermion strings) between two M-blocks of one orbit, as
+a sparse matrix: a one-body or pair term connects each determinant to at most
+about N others, while the blocks reach several thousand determinants at
+N = 20.  Built dense, the products with the highest-weight vectors in
+`stretched` cost d_out/N times the necessary work, which made the reduced
+matrix elements the dominant cold-build cost from N = 19 on.  Duplicate
+entries are summed, as the dense accumulation did."""
 function block_operator(orb::Orbit, terms, n_in, two_M_in, n_out, two_M_out)
     source = get(blocks(orb, n_in), two_M_in, Int[])
     target = get(blocks(orb, n_out), two_M_out, Int[])
     index = Dict(s => i for (i, s) in enumerate(target))
-    matrix = zeros(length(target), length(source))
+    rows = Int[]
+    cols = Int[]
+    vals = Float64[]
     for (column, state) in enumerate(source)
         for (coefficient, ops) in terms
             out, sign = apply_ops(state, ops)
             if sign != 0
                 row = get(index, out, 0)
-                row != 0 && (matrix[row, column] += sign * coefficient)
+                if row != 0
+                    push!(rows, row); push!(cols, column); push!(vals, sign * coefficient)
+                end
             end
         end
     end
-    return matrix
+    return SparseArrays.sparse(rows, cols, vals, length(target), length(source))
 end
 
-"""nullspace via full SVD, falling back from the divide-and-conquer LAPACK
-driver (dgesdd, which occasionally fails to converge on blocks this large --
-first seen on an N = 20 M-block) to QR iteration (dgesvd, slower, robust)."""
-function robust_nullspace(A::Matrix{Float64})
-    F = try
-        svd(A; full = true)
-    catch err
-        err isa LinearAlgebra.LAPACKException || rethrow()
-        svd(A; full = true, alg = LinearAlgebra.QRIteration())
+"""Kernel of the raising operator J+ on one M-block, as the zero eigenspace of
+J+' J+ = J- J+ = J^2 - M(M+1) restricted to the block.  Its spectrum,
+J(J+1) - M(M+1) for J >= M, is known exactly, so zero is separated from the
+rest by at least 2(M+1) >= 2, and a symmetric eigensolver restricted to
+(-1, 1] returns just the kernel.  This replaces a full SVD of J+, whose
+divide-and-conquer driver failed to converge on some blocks from N = 18 on and
+fell back to QR iteration, single-threaded and taking minutes per block at
+N = 20.  The kernel dimension is asserted to be dim(M) - dim(M+1)."""
+function hw_kernel(raising::SparseArrays.SparseMatrixCSC{Float64,Int}, mult::Int)
+    G = Symmetric(Matrix(raising' * raising))
+    F = eigen(G, -1.0, 1.0)
+    @assert length(F.values) == mult "kernel of J+ has $(length(F.values)) vectors, expected $mult"
+    return Matrix(F.vectors)
+end
+
+"""A * B for sparse A and dense B, threaded over the columns of B when the
+product is large; SparseArrays' own product runs on one thread."""
+function _sparse_times_dense(A::SparseArrays.SparseMatrixCSC{Float64,Int}, B::AbstractMatrix{Float64})
+    m = size(B, 2)
+    C = zeros(size(A, 1), m)
+    if m >= 2 && Threads.nthreads() > 1 && SparseArrays.nnz(A) * m > 2^18
+        Threads.@threads for j in 1:m
+            mul!(view(C, :, j), A, view(B, :, j))
+        end
+    else
+        mul!(C, A, B)
     end
-    tol = maximum(size(A)) * eps(Float64) *
-          (isempty(F.S) ? 1.0 : first(F.S))
-    rank = count(>(tol), F.S)
-    return F.V[:, rank+1:end]
+    return C
 end
 
-"""Highest-weight vectors: {two_J => (d_block x mult)}, kernel of J+."""
+"""Particle-hole conjugation of one flavour tower, c+_m -> (-1)^(j-m) c_{-m},
+the hole operator that transforms like c+_m, so the map commutes with
+rotations and keeps M.  The canonical determinant c+_{a1}...c+_{an}|0>
+(a1 < ... < an) goes to the image string applied to the full shell
+|full> = c+_0...c+_{N-1}|0>.  For each state of blocks(orb, n)[two_M] returns
+the position of its image in blocks(orb, N-n)[two_M] and the sign."""
+function ph_image(orb::Orbit, n::Int, two_M::Int)
+    source = get(blocks(orb, n), two_M, Int[])
+    target = get(blocks(orb, orb.N - n), two_M, Int[])
+    index = Dict(s => i for (i, s) in enumerate(target))
+    full = (1 << orb.N) - 1
+    rows = zeros(Int, length(source))
+    signs = zeros(Int, length(source))
+    for (column, state) in enumerate(source)
+        ops = Tuple{Bool,Int}[]
+        sign = 1
+        bits = state
+        while bits != 0
+            k = trailing_zeros(bits)             # ascending: reading order
+            push!(ops, (false, orb.N - 1 - k))   # m -> -m
+            isodd(orb.two_j - k) && (sign = -sign)   # j - m = two_j - k
+            bits &= bits - 1
+        end
+        out, s = apply_ops(full, ops)
+        @assert s != 0 && haskey(index, out)
+        rows[column] = index[out]
+        signs[column] = sign * s
+    end
+    return rows, signs
+end
+
+"""Apply the tower particle-hole map to the columns of `vectors`, which live
+on blocks(orb, n)[two_M]; the result lives on blocks(orb, N-n)[two_M]."""
+function ph_apply(orb::Orbit, n::Int, two_M::Int, vectors::Matrix{Float64})
+    rows, signs = ph_image(orb, n, two_M)
+    out = zeros(block_dim(orb, orb.N - n, two_M), size(vectors, 2))
+    for (r, row) in enumerate(rows)
+        @views out[row, :] .= signs[r] .* vectors[r, :]
+    end
+    return out
+end
+
+"""Highest-weight vectors: {two_J => (d_block x mult)}, kernel of J+.
+
+The bases are chosen so that the tower particle-hole map `ph_image` is a
+signed permutation of multiplet labels (see `ph_multiplet_map`): for n > N/2
+the vectors are the particle-hole images of those for N - n, and for the
+self-conjugate n = N/2 the SVD basis is rotated to the real Schur form of the
+map.  Any orthonormal choice gives the same spectra; this one lets the
+Ising sectors be split by particle-hole parity (`Sector(...; ph = +-1)`)."""
 function hw(orb::Orbit, n::Int)
     get!(orb.hw, n) do
+        2n > orb.N && return Dict(two_J => ph_apply(orb, orb.N - n, two_J, m)
+                                  for (two_J, m) in hw(orb, orb.N - n))
         out = Dict{Int,Matrix{Float64}}()
         jj = 0.25 * orb.two_j * (orb.two_j + 2)
         for (two_M, states) in sort(collect(blocks(orb, n)); by = first)
@@ -305,7 +580,17 @@ function hw(orb::Orbit, n::Int)
                           [(true, k + 1), (false, k)])
                          for k in 0:orb.N-2]
                 raising = block_operator(orb, terms, n, two_M, n, two_M + 2)
-                out[two_M] = robust_nullspace(raising)
+                out[two_M] = hw_kernel(raising, length(states) - d_up)
+            end
+        end
+        if 2n == orb.N
+            # self-conjugate tower: the particle-hole map U = W' C W is
+            # orthogonal with U^2 = +-1; its real Schur form is diagonal (+-1)
+            # or 2x2 rotations by pi/2, i.e. a signed permutation
+            for (two_J, W) in out
+                U = W' * ph_apply(orb, n, two_J, W)
+                F = schur(U)
+                out[two_J] = W * F.Z
             end
         end
         out
@@ -313,6 +598,32 @@ function hw(orb::Orbit, n::Int)
 end
 
 multiplets(orb::Orbit, n) = Dict(J => size(m, 2) for (J, m) in hw(orb, n))
+
+"""Particle-hole map on multiplet labels: C hw(n)[J] = hw(N-n)[J] U, with U a
+signed permutation in the bases chosen by `hw`.  Returns (perm, sign): column
+a of hw(n)[J] goes to column perm[a] of hw(N-n)[J] with sign[a].  Both the
+invariance of the highest-weight space and the permutation structure are
+asserted, so a wrong phase in `ph_image` cannot pass silently."""
+function ph_multiplet_map(orb::Orbit, n::Int, two_J::Int)
+    get!(orb.ph, (n, two_J)) do
+        source = hw(orb, n)[two_J]
+        target = hw(orb, orb.N - n)[two_J]
+        image = ph_apply(orb, n, two_J, source)
+        U = target' * image
+        @assert maximum(abs, image .- target * U; init = 0.0) < 1e-9 "ph map leaves the highest-weight space"
+        m = size(U, 2)
+        perm = zeros(Int, m)
+        sign = zeros(Int, m)
+        for a in 1:m
+            b = argmax(abs.(U[:, a]))
+            @assert abs(abs(U[b, a]) - 1) < 1e-9 "ph map is not a signed permutation"
+            perm[a] = b
+            sign[a] = U[b, a] > 0 ? 1 : -1
+        end
+        @assert sort(perm) == 1:m
+        (perm, sign)
+    end
+end
 
 # =============================================================================
 # 3. Tensor operators and reduced matrix elements
@@ -373,7 +684,7 @@ function stretched(orb::Orbit, terms, n_in, two_J, n_out, two_Jp, two_k)
     hw_out = get(hw(orb, n_out), two_Jp, nothing)
     (hw_in === nothing || hw_out === nothing) && return nothing
     op = block_operator(orb, terms, n_in, two_J, n_out, two_Jp)
-    matrix = hw_out' * (op * hw_in)
+    matrix = hw_out' * _sparse_times_dense(op, hw_in)
     c = cg(two_J, two_J, two_k, two_Jp - two_J, two_Jp, two_Jp)
     return matrix .* (sqrt(two_Jp + 1.0) / c)
 end
@@ -382,139 +693,6 @@ rme_t(orb, n, two_lam, two_Jp, two_J) =
     get!(() -> stretched(orb, t_terms(orb.N, two_lam, two_Jp - two_J),
                          n, two_J, n, two_Jp, two_lam),
          orb.rme_t, (n, two_lam, two_Jp, two_J))
-
-"""A_{J0 mu}, the adjoint of `pair_create_terms`: the daggers drop and the two
-operators swap, since the list is read in operator (physics) order."""
-function pair_annih_terms(N, two_J0, two_mu)
-    [(v, [(false, ops[2][2]), (false, ops[1][2])])
-     for (v, ops) in pair_create_terms(N, two_J0, two_mu)]
-end
-
-"""Terms of the coupled two-body density tensor
-
-    W^lam_mu(J1, J2) = sum_{mu1 mu2} <J1 mu1; J2 mu2 | lam mu>
-                       A+_{J1 mu1} Atilde_{J2 mu2},
-
-with `Atilde_{J mu} = (-1)^{(J-mu)/2} A_{J,-mu}` the time-reversed pair
-annihilator.  Any two-body operator is a combination of these."""
-function two_body_terms(N, two_J1, two_J2, two_lam, two_mu)
-    out = Tuple{Float64,Vector{Tuple{Bool,Int}}}[]
-    for two_mu1 in -two_J1:2:two_J1
-        two_mu2 = two_mu - two_mu1
-        abs(two_mu2) <= two_J2 || continue
-        coefficient = cg(two_J1, two_mu1, two_J2, two_mu2, two_lam, two_mu)
-        coefficient == 0 && continue
-        weight = coefficient * phase((two_J2 - two_mu2) ÷ 2)
-        for (v1, o1) in pair_create_terms(N, two_J1, two_mu1),
-            (v2, o2) in pair_annih_terms(N, two_J2, -two_mu2)
-            push!(out, (weight * v1 * v2, vcat(o1, o2)))
-        end
-    end
-    return out
-end
-
-"""    rme_tt(orb, n, two_J1, two_J2, two_lam, two_Jp, two_J)
-
-Reduced matrix elements `<n J\' a\' || W^lam(J1,J2) || n J a>` of the two-body
-density tensor, the two-body analogue of [`rme_t`](@ref).  A three-body term
-with two of its particles in this orbit factorises through these."""
-rme_tt(orb, n, two_J1, two_J2, two_lam, two_Jp, two_J) =
-    get!(() -> stretched(orb, two_body_terms(orb.N, two_J1, two_J2, two_lam,
-                                             two_Jp - two_J),
-                         n, two_J, n, two_Jp, two_lam),
-         orb.rme_tt, (n, two_J1, two_J2, two_lam, two_Jp, two_J))
-
-"""B+_{K M}(J12): a pair coupled to `J12`, then coupled with a third particle to
-total `K`.  Three identical fermions need the intermediate `J12` as a label, so
-the family is over-complete rather than orthogonal; the channel decomposition
-must account for that.  `K` is half-integer, so `two_K` is odd."""
-function triple_create_terms(N, two_J12, two_K, two_M)
-    two_j = N - 1
-    out = Tuple{Float64,Vector{Tuple{Bool,Int}}}[]
-    for two_mu in -two_J12:2:two_J12
-        two_m = two_M - two_mu
-        k = (two_m + two_j) ÷ 2
-        (0 <= k < N && iseven(two_m + two_j)) || continue
-        coefficient = cg(two_J12, two_mu, two_j, two_m, two_K, two_M)
-        coefficient == 0 && continue
-        for (v, ops) in pair_create_terms(N, two_J12, two_mu)
-            push!(out, (coefficient * v, vcat(ops, [(true, k)])))
-        end
-    end
-    return out
-end
-
-"""B_{K M}(J12), the adjoint of [`triple_create_terms`](@ref)."""
-triple_annih_terms(N, two_J12, two_K, two_M) =
-    [(v, reverse([(!dagger, k) for (dagger, k) in ops]))
-     for (v, ops) in triple_create_terms(N, two_J12, two_K, two_M)]
-
-"""Terms of the coupled three-body density tensor
-
-    V^lam_mu(K1,J12a; K2,J12b) = sum_{M1 M2} <K1 M1; K2 M2 | lam mu>
-                                 B+_{K1 M1}(J12a) Btilde_{K2 M2}(J12b).
-
-Because `K` is half-integer here, the scalar case carries an extra `(-1)^{2K}`
-relative to the two-body one: summing `(-1)^{2K} sqrt(2K+1) V^0_0(K,J12)` over
-`K` gives `(n-2)` times the pair count in channel `J12`."""
-function three_body_terms(N, two_J12a, two_K1, two_J12b, two_K2, two_lam, two_mu)
-    out = Tuple{Float64,Vector{Tuple{Bool,Int}}}[]
-    for two_M1 in -two_K1:2:two_K1
-        two_M2 = two_mu - two_M1
-        abs(two_M2) <= two_K2 || continue
-        coefficient = cg(two_K1, two_M1, two_K2, two_M2, two_lam, two_mu)
-        coefficient == 0 && continue
-        weight = coefficient * phase((two_K2 - two_M2) ÷ 2)
-        for (v1, o1) in triple_create_terms(N, two_J12a, two_K1, two_M1),
-            (v2, o2) in triple_annih_terms(N, two_J12b, two_K2, -two_M2)
-            push!(out, (weight * v1 * v2, vcat(o1, o2)))
-        end
-    end
-    return out
-end
-
-"""    rme_ttt(orb, n, two_J12a, two_K1, two_J12b, two_K2, two_lam, two_Jp, two_J)
-
-Reduced matrix elements of the three-body density tensor within one orbit, the
-three-body analogue of [`rme_t`](@ref) and [`rme_tt`](@ref).  A three-body term
-with all three particles in this orbit factorises through these."""
-rme_ttt(orb, n, two_J12a, two_K1, two_J12b, two_K2, two_lam, two_Jp, two_J) =
-    get!(() -> stretched(orb,
-                         three_body_terms(orb.N, two_J12a, two_K1, two_J12b,
-                                          two_K2, two_lam, two_Jp - two_J),
-                         n, two_J, n, two_Jp, two_lam),
-         orb.rme_ttt,
-         (n, two_J12a, two_K1, two_J12b, two_K2, two_lam, two_Jp, two_J))
-
-"""Terms of `Q^lam_mu(K,J12) = [B+^K(J12) x ctilde]^lam`: three creations and one
-annihilation, so it raises the orbit occupancy by two.  This is the per-orbit
-factor of a three-body term that moves particles between the two orbits."""
-function quad_terms(N, two_J12, two_K, two_lam, two_mu)
-    two_j = N - 1
-    out = Tuple{Float64,Vector{Tuple{Bool,Int}}}[]
-    for two_M in -two_K:2:two_K
-        two_m = two_M - two_mu
-        k = (two_m + two_j) ÷ 2
-        (0 <= k < N && iseven(two_m + two_j)) || continue
-        coefficient = cg(two_K, two_M, two_j, -two_m, two_lam, two_mu)
-        coefficient == 0 && continue
-        weight = coefficient * phase((two_j + two_m) ÷ 2)
-        for (v, ops) in triple_create_terms(N, two_J12, two_K, two_M)
-            push!(out, (weight * v, vcat(ops, [(false, k)])))
-        end
-    end
-    return out
-end
-
-"""    rme_q(orb, n_top, two_J12, two_K, two_lam, two_Jp, two_J)
-
-Reduced matrix elements of [`quad_terms`](@ref) between `n_top - 2` and `n_top`
-particles, the occupancy-raising partner of [`rme_pair`](@ref)."""
-rme_q(orb, n_top, two_J12, two_K, two_lam, two_Jp, two_J) =
-    get!(() -> stretched(orb, quad_terms(orb.N, two_J12, two_K, two_lam,
-                                         two_Jp - two_J),
-                         n_top - 2, two_J, n_top, two_Jp, two_lam),
-         orb.rme_q, (n_top, two_J12, two_K, two_lam, two_Jp, two_J))
 
 rme_pair(orb, n_top, two_J0, two_Jp, two_J) =
     get!(() -> stretched(orb, pair_create_terms(orb.N, two_J0,
@@ -812,6 +990,7 @@ end
 """Static susceptibility (reduced units): chi = 2 <v|(H - E0)^{-1}|v> by
 conjugate gradient on the positive-definite shifted sector Hamiltonian."""
 function reduced_chi(dst, v::Vector{Float64}, E0; tol = 1e-8)
+    dst.ph == 0 || error("reduced_chi needs the full block; build dst with ph = 0")
     buffers, tmps, ranges = workspace(dst)
     Hx = x -> matvec!(zeros(dst.dim), dst, x, buffers, tmps, ranges) .- E0 .* x
     x = zeros(dst.dim)
@@ -847,6 +1026,66 @@ struct Task
     rm::Matrix{Float64}                          # (mult'_-, mult_-)
 end
 
+"""All tasks that write to one output channel through the same right factor
+R_+:  Y_out += (sum_t coef_t R_-^(t) X_in^(t)) R_+', the right product formed
+once.  R_+ is cached per (n, lambda, J', J), so tasks that differ only in the
+input J_- hold the same object and fall in one group.  On the L = 2 blocks
+this cuts the arithmetic to 0.61 of task-by-task (grouping on the input side
+instead gives 0.67); at L = 0 every group holds a single task."""
+struct OutGroup
+    rp::Matrix{Float64}                          # (mult'_+, mult_+)
+    in_off::Vector{Int}
+    coef::Vector{Float64}
+    rm::Vector{Matrix{Float64}}                  # (mult'_-, mult_-) each
+end
+
+"""One output channel with its diagonal part and task groups.  Channels are
+disjoint blocks of rows, so matvec workers own whole channels and write y
+directly.  `diag` indexes `Sector.diagonal`; `cost` is in multiply-adds."""
+struct OutChannel
+    off::Int
+    mp::Int                                      # mult'_+
+    mm::Int                                      # mult'_-
+    diag::Int
+    has_w::Bool                                  # same-flavour W_+-, if nonzero
+    groups::Vector{OutGroup}
+    cost::Int
+end
+
+function build_work(tasks::Vector{Task}, diagonal)
+    groups_at = Dict{Int,Vector{OutGroup}}()
+    index = Dict{Tuple{Int,UInt},Int}()
+    for t in tasks
+        list = get!(() -> OutGroup[], groups_at, t.out_off)
+        key = (t.out_off, objectid(t.rp))
+        g = get(index, key, 0)
+        if g == 0
+            push!(list, OutGroup(t.rp, Int[], Float64[], Matrix{Float64}[]))
+            g = index[key] = length(list)
+        end
+        push!(list[g].in_off, t.in_off)
+        push!(list[g].coef, t.coef)
+        push!(list[g].rm, t.rm)
+    end
+    work = OutChannel[]
+    for (k, (off, scalar, w_plus, w_minus)) in enumerate(diagonal)
+        mp, mm = size(w_plus, 1), size(w_minus, 1)
+        has_w = !(iszero(w_plus) && iszero(w_minus))
+        groups = get(groups_at, off, OutGroup[])
+        cost = mp * mm * (has_w ? 1 + mp + mm : 1)
+        for g in groups
+            a, b = size(g.rp)
+            @assert a == mp && all(size(r, 1) == mm for r in g.rm)
+            cost += mm * b * (a + sum(size(r, 2) for r in g.rm))
+        end
+        push!(work, OutChannel(off, mp, mm, k, has_w, groups, cost))
+        delete!(groups_at, off)
+    end
+    @assert isempty(groups_at) "task output outside the diagonal channels"
+    sort!(work; by = w -> -w.cost)               # largest first for the queue
+    return work
+end
+
 struct Sector
     N::Int
     h::Float64
@@ -857,7 +1096,15 @@ struct Sector
     offset::Dict{NTuple{3,Int},Int}
     diagonal::Vector{Tuple{Int,Float64,Matrix{Float64},Matrix{Float64}}}
     tasks::Vector{Task}
+    work::Vector{OutChannel}  # the tasks by output channel, for the matvec
+    ph::Int                   # 0: full block; +-1: particle-hole parity
+    rep::Vector{Int}          # reduced basis vector k = (e_rep + coef e_partner)/sqrt2,
+    partner::Vector{Int}      #   or e_rep alone where partner = 0
+    coef::Vector{Float64}
 end
+
+"Dimension of the block actually diagonalised (the particle-hole half if ph != 0)."
+rdim(s::Sector) = s.ph == 0 ? s.dim : length(s.rep)
 
 Sector(N, h, V0::Real, V1::Real, L, z2; kwargs...) =
     Sector(N, h, [Float64(V0), Float64(V1)], L, z2; kwargs...)
@@ -866,8 +1113,17 @@ Sector(N, h, V0::Real, V1::Real, L, z2; kwargs...) =
 (their `GetDenIntTerms` argument is `2 .* ps_pot`).  In the sigma^x basis the
 even-l potentials feed the (+-) channels at odd pair-J = N-1-l and the odd-l
 potentials feed the same-flavour channels at even pair-J -- the structure that
-`validate` pins against FuzzifiED one l at a time."""
-function Sector(N, h, ps_pot::Vector{Float64}, L, z2; n_minus_max = nothing)
+`validate` pins against FuzzifiED one l at a time.
+
+`ph = +-1` restricts the block to one parity of the particle-hole symmetry
+(see `ph_permutation`), which commutes with rotations and halves the block;
+`ph = 0` keeps the whole (L, Z2) block.  Only the tasks whose output lies in
+the channels with J_+ >= J_- are built, since a vector of definite parity is
+fixed by those."""
+function Sector(N, h, ps_pot::Vector{Float64}, L, z2; n_minus_max = nothing,
+                ph = 0)
+    ph in (-1, 0, 1) || error("ph must be -1, 0 or +1")
+    keep(ch) = ph == 0 || ch[2] >= ch[3]
     orb = orbit(N)
     two_L = 2L
     channels = NTuple{5,Int}[]
@@ -906,6 +1162,7 @@ function Sector(N, h, ps_pot::Vector{Float64}, L, z2; n_minus_max = nothing)
     end
 
     for (n_minus, two_Jp, two_Jm, mult_p, mult_m) in channels
+        keep((n_minus, two_Jp, two_Jm)) || continue
         n_plus = N - n_minus
         scalar = -h * (n_plus - n_minus)
         w_plus = zeros(mult_p, mult_p)
@@ -922,6 +1179,7 @@ function Sector(N, h, ps_pot::Vector{Float64}, L, z2; n_minus_max = nothing)
     for (n_minus, group) in by_n
         n_plus = N - n_minus
         for out_ch in group, in_ch in group
+            keep(out_ch) || continue
             _, Jp_o, Jm_o, _, _ = out_ch
             _, Jp_i, Jm_i, _, _ = in_ch
             for (two_lam, c) in c_lambda
@@ -950,6 +1208,7 @@ function Sector(N, h, ps_pot::Vector{Float64}, L, z2; n_minus_max = nothing)
                 0 <= n_minus_o <= N || continue
                 n_plus_i = N - n_minus_i
                 for out_ch in get(by_n, n_minus_o, NTuple{5,Int}[])
+                    keep(out_ch) || continue
                     _, Jp_o, Jm_o, _, _ = out_ch
                     (abs(Jp_o - Jp_i) <= two_J0 &&
                      abs(Jm_o - Jm_i) <= two_J0) || continue
@@ -975,359 +1234,185 @@ function Sector(N, h, ps_pot::Vector{Float64}, L, z2; n_minus_max = nothing)
             end
         end
     end
-    return Sector(N, h, L, z2, position, channels, offset, diagonal, tasks)
-end
-
-# Hand-rolled kernels for the tiny per-task GEMMs: at typical block sizes
-# (5-100) a BLAS call costs more in dispatch than in arithmetic, and calling
-# OpenBLAS from many Julia threads contends on its internal pool -- measured
-# at 137 ms/matvec via mul! against 34 ms for the equivalent C kernel.
-
-"""T(c,b) = Rm(c,d) * X, X read column-major from x at in_off."""
-@inline function _left_mul!(T, rm, x, in_off, b, d)
-    c = size(rm, 1)
-    @inbounds for col in 1:b
-        for i in 1:c
-            T[i, col] = 0.0
-        end
-        base = in_off + (col - 1) * d
-        for l in 1:d
-            v = x[base+l]
-            v == 0.0 && continue
-            @simd for i in 1:c
-                T[i, col] += rm[i, l] * v
+    rep, partner, coef = Int[], Int[], Float64[]
+    if ph != 0
+        perm, sign = ph_permutation(N, two_L, channels, offset, position)
+        for (n_minus, two_Jp, two_Jm, mult_p, mult_m) in channels
+            two_Jp >= two_Jm || continue
+            off = offset[(n_minus, two_Jp, two_Jm)]
+            for i in off+1:off+mult_p*mult_m
+                j = perm[i]
+                if j == i
+                    sign[i] == ph && (push!(rep, i); push!(partner, 0);
+                                      push!(coef, 0.0))
+                elseif two_Jp > two_Jm || i < j
+                    push!(rep, i); push!(partner, j); push!(coef, ph * sign[i])
+                end
             end
         end
     end
+    CACHE_DIR[] === nothing || save_tables(N)
+    return Sector(N, h, L, z2, position, channels, offset, diagonal, tasks,
+                  build_work(tasks, diagonal), ph, rep, partner, coef)
 end
 
-"""buffer[out_off + .] += coef * T(c,b) * Rp'(b,a), column-major."""
-@inline function _right_mul!(buffer, out_off, T, rp, coef, a, b, c)
-    @inbounds for j in 1:a
-        base = out_off + (j - 1) * c
-        for l in 1:b
-            v = coef * rp[j, l]
-            v == 0.0 && continue
-            @simd for i in 1:c
-                buffer[base+i] += v * T[i, l]
-            end
+"""Particle-hole symmetry of the Ising sector as a signed permutation of the
+coupled basis: basis vector i goes to sign[i] * e_perm[i].
+
+The symmetry swaps the two sigma^x towers and conjugates each one
+(`ph_image`), so channel (n_-, J_+, J_-) goes to (n_-, J_-, J_+) with the
+multiplet labels permuted by `ph_multiplet_map`.  The channel sign has two
+parts, (-1)^(n_+ (n_- + N)) from carrying the image of the + string past the
+- string and the filled shell, and (-1)^(J_+ + J_- - L) from recoupling in
+the opposite order.  These give a symmetry for either overall sign; the
+factor z2 (-1)^(N(N+1)/2) = (-1)^n_- (-1)^(N(N+1)/2) makes it equal to
+FuzzifiED's GetParityQNOffd(N, 2, [2, 1], [-1, 1]) * GetRotyQNOffd(N, 2), so
+ph = +1 is FuzzifiED's P R_y = +1 sector.  The (-1)^n_- is FuzzifiED's minus
+sign on the second flavour; the N-dependent part was FITTED against
+FuzzifiED at N = 6..11 and is checked in `validate` -- validated, not
+derived.  [H, P] = 0 and P^2 = 1 are checked there too."""
+function ph_permutation(N, two_L, channels, offset, dim)
+    orb = orbit(N)
+    perm = zeros(Int, dim)
+    sign = zeros(Int, dim)
+    for (n_minus, two_Jp, two_Jm, mult_p, mult_m) in channels
+        n_plus = N - n_minus
+        off = offset[(n_minus, two_Jp, two_Jm)]
+        off_bar = offset[(n_minus, two_Jm, two_Jp)]
+        s_c = phase(n_plus * (n_minus + N)) *
+              phase((two_Jp + two_Jm - two_L) ÷ 2) *
+              phase(n_minus) * phase(N * (N + 1) ÷ 2)       # FuzzifiED's label
+        perm_p, sign_p = ph_multiplet_map(orb, n_plus, two_Jp)
+        perm_m, sign_m = ph_multiplet_map(orb, n_minus, two_Jm)
+        for a in 1:mult_p, b in 1:mult_m
+            i = off + (a - 1) * mult_m + b
+            perm[i] = off_bar + (perm_m[b] - 1) * mult_p + perm_p[a]
+            sign[i] = Int(s_c) * sign_p[a] * sign_m[b]
         end
+    end
+    return perm, sign
+end
+
+# Small-GEMM microkernel.  The blocks are small (94% of the arithmetic has
+# 16-64 rows and a 16-64 inner dimension), where a BLAS call costs more in
+# dispatch than in arithmetic and OpenBLAS contends on its pool when called
+# from many Julia threads.  The kernel keeps an 8x4 tile of C in registers and
+# per step loads 8 elements of A and 4 of B for 32 multiply-adds; the earlier
+# axpy loops loaded and stored C for every multiply-add.  Single-threaded on
+# the M4 Max this runs at 22-28 G multiply-adds/s against 5-9 for the axpy
+# form and 7-27 for OpenBLAS on the same shapes.
+using Base.Cartesian: @nexprs
+
+for (MR, NR) in ((8, 4), (4, 4), (2, 4), (1, 4), (8, 1), (4, 1), (2, 1), (1, 1))
+    name = Symbol(:_tile_, MR, :x, NR, :!)
+    @eval @inline function $name(C, cb, ldc, A, ab, lda, B, bb, bsl, bsj, k, alpha)
+        @nexprs $NR j -> @nexprs $MR i -> c_i_j = 0.0
+        @inbounds for l in 0:k-1
+            ao = ab + l * lda
+            @nexprs $MR i -> a_i = A[ao+i]
+            bo = bb + l * bsl
+            @nexprs $NR j -> b_j = B[bo+(j-1)*bsj+1]
+            @nexprs $NR j -> @nexprs $MR i -> c_i_j = muladd(a_i, b_j, c_i_j)
+        end
+        @inbounds @nexprs $NR j -> @nexprs $MR i -> C[cb+(j-1)*ldc+i] += alpha * c_i_j
+        return nothing
     end
 end
 
-"""Threaded matvec: tasks partitioned over threads, each with a private
-output buffer; the diagonal part is applied once at the end."""
+"""C[coff + (j-1) m + i] += alpha sum_l A[aoff + (l-1) lda + i] B[boff + (l-1) bsl + (j-1) bsj + 1]
+for i <= m, j <= n, l <= k: C is m x n column-major in a flat array, A is read
+column-major with leading dimension lda, B through arbitrary strides (bsl, bsj),
+so B can be a column-major block (1, k) or the transpose of a matrix (n, 1)."""
+function _gemm!(C, coff, m, n, A, aoff, lda, B, boff, bsl, bsj, k, alpha)
+    j0 = 0
+    while j0 + 4 <= n
+        cb = coff + j0 * m
+        bb = boff + j0 * bsj
+        i0 = 0
+        while i0 + 8 <= m
+            _tile_8x4!(C, cb + i0, m, A, aoff + i0, lda, B, bb, bsl, bsj, k, alpha)
+            i0 += 8
+        end
+        i0 + 4 <= m && (_tile_4x4!(C, cb + i0, m, A, aoff + i0, lda, B, bb, bsl, bsj, k, alpha); i0 += 4)
+        i0 + 2 <= m && (_tile_2x4!(C, cb + i0, m, A, aoff + i0, lda, B, bb, bsl, bsj, k, alpha); i0 += 2)
+        i0 + 1 <= m && _tile_1x4!(C, cb + i0, m, A, aoff + i0, lda, B, bb, bsl, bsj, k, alpha)
+        j0 += 4
+    end
+    while j0 < n
+        cb = coff + j0 * m
+        bb = boff + j0 * bsj
+        i0 = 0
+        while i0 + 8 <= m
+            _tile_8x1!(C, cb + i0, m, A, aoff + i0, lda, B, bb, bsl, bsj, k, alpha)
+            i0 += 8
+        end
+        i0 + 4 <= m && (_tile_4x1!(C, cb + i0, m, A, aoff + i0, lda, B, bb, bsl, bsj, k, alpha); i0 += 4)
+        i0 + 2 <= m && (_tile_2x1!(C, cb + i0, m, A, aoff + i0, lda, B, bb, bsl, bsj, k, alpha); i0 += 2)
+        i0 + 1 <= m && _tile_1x1!(C, cb + i0, m, A, aoff + i0, lda, B, bb, bsl, bsj, k, alpha)
+        j0 += 1
+    end
+    return nothing
+end
+
+"""Threaded matvec over output channels.  Each channel is a disjoint block of
+rows, so workers take whole channels from a shared counter, largest first,
+and write y directly: no per-thread copies of y, no reduction, and a slower
+core simply ends up with fewer channels.  `buffers` and `ranges` are unused
+and kept for the signature."""
 function matvec!(y::AbstractVector{Float64}, sector::Sector,
                  x::AbstractVector{Float64}, buffers, tmps, ranges)
-    nthreads = length(buffers)
-    tasks = sector.tasks
-    Threads.@threads :static for w in 1:nthreads
-        buffer = buffers[w]
-        tmp = tmps[w]
-        fill!(buffer, 0.0)
-        for t in ranges[w]
-            task = tasks[t]
-            a, b = size(task.rp)                 # mult'_+, mult_+
-            c, d = size(task.rm)                 # mult'_-, mult_-
-            T = reshape(view(tmp, 1:c*b), c, b)
-            _left_mul!(T, task.rm, x, task.in_off, b, d)
-            _right_mul!(buffer, task.out_off, T, task.rp, task.coef, a, b, c)
+    work = sector.work
+    next = Threads.Atomic{Int}(1)
+    @sync for w in eachindex(tmps)
+        Threads.@spawn begin
+            tmp = tmps[w]
+            while true
+                k = Threads.atomic_add!(next, 1)
+                k > length(work) && break
+                _apply_channel!(y, sector, work[k], x, tmp)
+            end
         end
-    end
-    fill!(y, 0.0)
-    for buffer in buffers
-        y .+= buffer
-    end
-    for (off, scalar, w_plus, w_minus) in sector.diagonal
-        mp, mm = size(w_plus, 1), size(w_minus, 1)
-        X = reshape(view(x, off+1:off+mp*mm), mm, mp)
-        Y = reshape(view(y, off+1:off+mp*mm), mm, mp)
-        Y .+= scalar .* X
-        mul!(Y, w_minus, X, 1.0, 1.0)
-        mul!(Y, X, w_plus, 1.0, 1.0)             # W symmetric
     end
     return y
 end
 
+function _apply_channel!(y, sector::Sector, ch::OutChannel, x, tmp)
+    off, mp, mm = ch.off, ch.mp, ch.mm
+    _, scalar, w_plus, w_minus = sector.diagonal[ch.diag]
+    @inbounds for i in off+1:off+mp*mm
+        y[i] = scalar * x[i]
+    end
+    if ch.has_w
+        _gemm!(y, off, mm, mp, w_minus, 0, mm, x, off, 1, mm, mm, 1.0)   # W_- X
+        _gemm!(y, off, mm, mp, x, off, mm, w_plus, 0, mp, 1, mp, 1.0)    # X W_+' (W_+ symmetric)
+    end
+    for g in ch.groups
+        b = size(g.rp, 2)
+        @inbounds for i in 1:mm*b
+            tmp[i] = 0.0
+        end
+        for t in eachindex(g.in_off)                                     # U += coef R_- X_in
+            rm = g.rm[t]
+            d = size(rm, 2)
+            _gemm!(tmp, 0, mm, b, rm, 0, mm, x, g.in_off[t], 1, d, d, g.coef[t])
+        end
+        _gemm!(y, off, mm, mp, tmp, 0, mm, g.rp, 0, mp, 1, b, 1.0)       # Y += U R_+'
+    end
+    return nothing
+end
+
 function workspace(sector::Sector)
-    nthreads = max(1, Threads.nthreads())
-    max_tmp = isempty(sector.tasks) ? 1 :
-              maximum(size(t.rm, 1) * size(t.rp, 2) for t in sector.tasks)
-    # Partition tasks into contiguous ranges of equal FLOPs, not equal count:
-    # block sizes vary by orders of magnitude within one sector, and an
-    # equal-count split serialises on whichever thread drew the fat blocks.
-    flops = [size(t.rm, 1) * size(t.rp, 2) * (size(t.rm, 2) + size(t.rp, 1))
-             for t in sector.tasks]
-    target = sum(flops) / nthreads
-    ranges = UnitRange{Int}[]
-    start, load = 1, 0.0
-    for (t, f) in enumerate(flops)
-        load += f
-        if load >= target && length(ranges) < nthreads - 1
-            push!(ranges, start:t)
-            start, load = t + 1, 0.0
-        end
+    nworkers = max(1, Threads.nthreads())
+    max_tmp = 1
+    for ch in sector.work, g in ch.groups
+        max_tmp = max(max_tmp, ch.mm * size(g.rp, 2))
     end
-    push!(ranges, start:length(sector.tasks))
-    while length(ranges) < nthreads
-        push!(ranges, 1:0)
-    end
-    return ([zeros(sector.dim) for _ in 1:nthreads],
-            [zeros(max_tmp) for _ in 1:nthreads], ranges)
-end
-
-"""
-    add_three_body!(sector, two_J12a, two_K1, two_J12b, two_K2, weight; parity)
-
-Add `weight * V^0(K1,J12a; K2,J12b)` acting inside a single orbit to `sector`,
-as extra tasks in the factorised matvec.  `parity` is `:plus` or `:minus`, naming the orbit in the sigma^x basis.
-
-This is the channel of a three-body term with all three particles in one orbit.
-Being a scalar it is diagonal in both `J_+` and `J_-`, so the other orbit
-contributes only the identity and the recoupling reduces to
-[`scalar_coef`](@ref) at rank zero.
-
-Validated against a direct m-scheme diagonalization of the same term list.
-"""
-function add_three_body!(sector::Sector, two_J12a, two_K1, two_J12b, two_K2,
-                         weight; parity::Symbol = :plus)
-    parity in (:plus, :minus) || error("parity must be :plus or :minus")
-    N = sector.N; orb = orbit(N)
-    for channel in sector.channels
-        n_minus, two_Jp, two_Jm, mult_plus, mult_minus = channel
-        n_here = parity === :plus ? N - n_minus : n_minus
-        two_J_here = parity === :plus ? two_Jp : two_Jm
-        reduced = rme_ttt(orb, n_here, two_J12a, two_K1, two_J12b, two_K2, 0,
-                          two_J_here, two_J_here)
-        reduced === nothing && continue
-        # the spectator orbit contributes <J||1||J> = sqrt(2J+1)
-        spectator = parity === :plus ? two_Jm : two_Jp
-        coefficient = weight *
-            scalar_coef(two_Jp, two_Jm, two_Jp, two_Jm, 2 * sector.L, 0) *
-            sqrt(spectator + 1.0)
-        maximum(abs, reduced) * abs(coefficient) < 1e-14 && continue
-        offset = sector.offset[(n_minus, two_Jp, two_Jm)]
-        rp = parity === :plus ? reduced : Matrix{Float64}(I, mult_plus, mult_plus)
-        rm = parity === :plus ? Matrix{Float64}(I, mult_minus, mult_minus) : reduced
-        push!(sector.tasks, Task(offset, offset, coefficient, rp, rm))
-    end
-    return sector
-end
-
-"""
-    add_three_body_mixed!(sector, two_J1, two_J2, two_lam, weight; pair)
-
-Add the mixed channel of a three-body term: two of its particles in one orbit,
-the third in the other, coupled to a scalar.  `pair` is `:plus` or `:minus` and
-says which orbit holds the pair.
-
-The operator is `sum_q (-1)^q W^lam_q(pair orbit) T^lam_{-q}(other orbit)`, a
-rank-`lam` two-body tensor against a rank-`lam` one-body tensor.  That is the
-same shape as the two-body Hamiltonian, so it needs no new recoupling: the
-existing [`scalar_coef`](@ref) applies, with [`rme_tt`](@ref) replacing one of
-the one-body factors.  Unlike the single-orbit channel it connects different
-`J_+` and `J_-`, so the tasks run between channels.
-"""
-function add_three_body_mixed!(sector::Sector, two_J1, two_J2, two_lam, weight;
-                               pair::Symbol = :plus)
-    pair in (:plus, :minus) || error("pair must be :plus or :minus")
-    N = sector.N; orb = orbit(N)
-    for out_channel in sector.channels, in_channel in sector.channels
-        n_minus, Jp_out, Jm_out, _, _ = out_channel
-        n_minus_in, Jp_in, Jm_in, _, _ = in_channel
-        n_minus == n_minus_in || continue          # this channel conserves both counts
-        n_plus = N - n_minus
-        if pair === :plus
-            rp = rme_tt(orb, n_plus, two_J1, two_J2, two_lam, Jp_out, Jp_in)
-            rm = rme_t(orb, n_minus, two_lam, Jm_out, Jm_in)
-        else
-            rp = rme_t(orb, n_plus, two_lam, Jp_out, Jp_in)
-            rm = rme_tt(orb, n_minus, two_J1, two_J2, two_lam, Jm_out, Jm_in)
-        end
-        (rp === nothing || rm === nothing) && continue
-        coefficient = weight * scalar_coef(Jp_out, Jm_out, Jp_in, Jm_in,
-                                           2 * sector.L, two_lam)
-        abs(coefficient) * maximum(abs, rp) * maximum(abs, rm) < 1e-14 && continue
-        push!(sector.tasks, Task(sector.offset[out_channel[1:3]],
-                                 sector.offset[in_channel[1:3]],
-                                 coefficient, rp, rm))
-    end
-    return sector
-end
-
-"""
-    add_three_body_hop!(sector, two_J12, two_K, two_lam, weight)
-
-Add the occupancy-changing channel of a three-body term: three creations and one
-annihilation in the `+` orbit against a pair annihilation in the `-` orbit, and
-the hermitian conjugate.  The Ising parity `(-1)^{n_-}` is preserved because the
-occupancies move by two.
-
-The two factors are both rank `lam`, so [`scalar_coef`](@ref) again supplies the
-recoupling.  Unlike the same-flavour pair hop, which carries an extra fitted
-factor, this channel needs no cross-flavour constant: fitting one against an
-m-scheme expectation value returns 1 to nine digits.
-"""
-function add_three_body_hop!(sector::Sector, two_J12, two_K, two_lam, weight;
-                             single::Symbol = :plus)
-    single in (:plus, :minus) || error("single must be :plus or :minus")
-    N = sector.N; orb = orbit(N)
-    by_n = Dict{Int,Vector{NTuple{5,Int}}}()
-    for channel in sector.channels
-        push!(get!(() -> NTuple{5,Int}[], by_n, channel[1]), channel)
-    end
-    for in_channel in sector.channels
-        n_minus, Jp_in, Jm_in, _, _ = in_channel
-        n_plus = N - n_minus
-        shift = single === :plus ? -2 : 2
-        for out_channel in get(by_n, n_minus + shift, NTuple{5,Int}[])
-            _, Jp_out, Jm_out, _, _ = out_channel
-            # the one-body factor rides with the orbit named by `single`; the
-            # other orbit contributes a bare pair.
-            rp, rm = single === :plus ?
-                (rme_q(orb, n_plus + 2, two_J12, two_K, two_lam, Jp_out, Jp_in),
-                 rme_y(orb, n_minus, two_lam, Jm_out, Jm_in)) :
-                (rme_y(orb, n_plus, two_lam, Jp_out, Jp_in),
-                 rme_q(orb, n_minus + 2, two_J12, two_K, two_lam, Jm_out, Jm_in))
-            (rp === nothing || rm === nothing) && continue
-            coefficient = weight * scalar_coef(Jp_out, Jm_out, Jp_in, Jm_in,
-                                               2 * sector.L, two_lam)
-            abs(coefficient) * maximum(abs, rp) * maximum(abs, rm) < 1e-14 && continue
-            out_off = sector.offset[out_channel[1:3]]
-            in_off  = sector.offset[in_channel[1:3]]
-            push!(sector.tasks, Task(out_off, in_off, coefficient, rp, rm))
-            # the hermitian conjugate, so the added term is symmetric
-            push!(sector.tasks, Task(in_off, out_off, coefficient,
-                                     Matrix(rp'), Matrix(rm')))
-        end
-    end
-    return sector
-end
-
-"""
-    three_body_channels(N; lam_max = 8)
-
-Enumerate the invariant three-body channels this solver can add, as
-`(kind, (a, b, c))` tuples.  `kind` is one of
-
-  * `:plus`, `:minus` -- all three particles in that orbit, `(2J12, 2K, 0)`
-  * `:mixp`, `:mixm`  -- a pair in that orbit and one in the other, `(2J1, 2J2, 2lam)`
-  * `:hop`, `:hopm`   -- a pair moved between orbits with the remaining one-body
-                        factor on the `+` (`:hop`) or `-` (`:hopm`) orbit,
-                        `(2J12, 2K, 2lam)`
-
-Every entry is Hermitian, so any weighted sum is a legal Hamiltonian term.  The
-family is over-complete: many entries give the zero operator, and those that do
-not are still linearly dependent, so a decomposition onto them wants a
-least-squares solve ([`decompose_three_body`](@ref)) rather than an exact
-inversion.  It is also complete -- with `lam_max = 2(N-1)` the nonzero entries
-span every Hermitian `SO(3)`-invariant three-body operator that preserves
-`(-1)^n_-`, 56 of them at `N = 6` and 126 at `N = 8`.
-"""
-function three_body_channels(N; lam_max = 8)
-    two_j = N - 1
-    out = Tuple{Symbol,NTuple{3,Int}}[]
-    for two_J12 in 0:2:(2two_j), two_K in abs(two_J12 - two_j):2:(two_J12 + two_j)
-        push!(out, (:plus, (two_J12, two_K, 0)))
-        push!(out, (:minus, (two_J12, two_K, 0)))
-        for two_lam in 0:2:min(2two_j, lam_max)
-            push!(out, (:hop, (two_J12, two_K, two_lam)))
-            push!(out, (:hopm, (two_J12, two_K, two_lam)))
-        end
-    end
-    for two_J1 in 0:2:(2two_j), two_J2 in two_J1:2:(2two_j),
-        two_lam in abs(two_J1 - two_J2):2:min(two_J1 + two_J2, lam_max)
-        push!(out, (:mixp, (two_J1, two_J2, two_lam)))
-        push!(out, (:mixm, (two_J1, two_J2, two_lam)))
-    end
-    return out
-end
-
-"""
-    add_channel!(sector, channel, weight)
-
-Add one entry of [`three_body_channels`](@ref) to `sector`, dispatching to
-[`add_three_body!`](@ref), [`add_three_body_mixed!`](@ref) or
-[`add_three_body_hop!`](@ref).
-"""
-function add_channel!(sector::Sector, channel, weight)
-    kind, (a, b, c) = channel
-    kind === :plus  && return add_three_body!(sector, a, b, a, b, weight; parity = :plus)
-    kind === :minus && return add_three_body!(sector, a, b, a, b, weight; parity = :minus)
-    if kind === :mixp || kind === :mixm
-        # W^lam(J1, J2) is not Hermitian unless J1 == J2, so pair it with
-        # W^lam(J2, J1); every channel is then usable in a Hamiltonian as it is.
-        pair = kind === :mixp ? :plus : :minus
-        w = a == b ? weight : weight / 2
-        add_three_body_mixed!(sector, a, b, c, w; pair = pair)
-        a == b || add_three_body_mixed!(sector, b, a, c, w; pair = pair)
-        return sector
-    end
-    kind === :hop   && return add_three_body_hop!(sector, a, b, c, weight; single = :plus)
-    kind === :hopm  && return add_three_body_hop!(sector, a, b, c, weight; single = :minus)
-    error("unknown three-body channel kind $kind")
-end
-
-"""
-    channel_design(N, specs; lam_max = 8, tol = 1e-9)
-
-Evaluate every entry of [`three_body_channels`](@ref) on the sectors named by
-`specs`, a list of `(L, z2)` pairs, and return `(channels, A)`.  The sectors are
-built with all couplings zero, so each channel's matrix is what the channel adds
-and nothing else; column `k` of `A` is channel `k` flattened and stacked over the
-sectors.  Channels whose operator vanishes on every listed sector are dropped
-from both the list and the matrix.
-
-`A` is rank-deficient -- the channel labels outnumber the operators they produce
--- so use [`decompose_three_body`](@ref) rather than a direct solve.
-"""
-function channel_design(N, specs; lam_max = 8, tol = 1e-9)
-    chans = three_body_channels(N; lam_max = lam_max)
-    sectors = [Sector(N, 0.0, 0.0, 0.0, L, z2) for (L, z2) in specs]
-    marks = [length(s.tasks) for s in sectors]
-    rows = sum(s.dim^2 for s in sectors)
-    columns = Vector{Float64}[]
-    kept = eltype(chans)[]
-    for channel in chans
-        column = Vector{Float64}(undef, rows)
-        at = 0
-        for (s, mark) in zip(sectors, marks)
-            add_channel!(s, channel, 1.0)
-            block = dense(s)
-            resize!(s.tasks, mark)                 # restore the empty sector
-            column[at+1:at+length(block)] .= vec(block)
-            at += length(block)
-        end
-        if maximum(abs, column) > tol
-            push!(columns, column)
-            push!(kept, channel)
-        end
-    end
-    return kept, isempty(columns) ? zeros(rows, 0) : reduce(hcat, columns)
-end
-
-"""
-    decompose_three_body(A, target; rtol = 1e-8)
-
-Least-squares weights for `target` over the channel columns of `A`, returned as
-`(weights, residual)` with `residual` the relative norm of what is left over.
-
-The channel family is linearly dependent, so the weights are not unique; this
-returns the minimum-norm solution, obtained by dropping singular values below
-`rtol` times the largest.  A residual near machine precision says the target is
-a combination of the channels, and the reconstruction `A * weights` is then
-well defined even though the weights themselves are one representative of a
-family.
-"""
-function decompose_three_body(A, target::AbstractVector; rtol = 1e-8)
-    F = svd(A)
-    keep = F.S .> rtol * (isempty(F.S) ? 1.0 : F.S[1])
-    weights = F.V[:, keep] * ((F.U[:, keep]' * target) ./ F.S[keep])
-    residual = norm(A * weights .- target) / max(norm(target), eps())
-    return weights, residual
+    return (Vector{Float64}[], [zeros(max_tmp) for _ in 1:nworkers],
+            UnitRange{Int}[])
 end
 
 function dense(sector::Sector)
+    sector.ph == 0 || error("dense() needs the full block; build it with ph = 0")
     matrix = zeros(sector.dim, sector.dim)
     for (off, scalar, w_plus, w_minus) in sector.diagonal
         mp, mm = size(w_plus, 1), size(w_minus, 1)
@@ -1359,15 +1444,263 @@ LinearAlgebra.mul!(y::AbstractVector, op::SectorOperator, x::AbstractVector) =
 LinearAlgebra.ishermitian(::SectorOperator) = true
 Base.eltype(::SectorOperator) = Float64
 
+# ---- particle-hole halves (Sector(...; ph = +-1)) ---------------------------
+
+"""Reduced vector -> full coupled-basis vector of definite particle-hole parity."""
+function ph_expand!(x::AbstractVector{Float64}, s::Sector, xr::AbstractVector{Float64})
+    fill!(x, 0.0)
+    r = inv(sqrt(2.0))
+    @inbounds for k in eachindex(s.rep)
+        if s.partner[k] == 0
+            x[s.rep[k]] = xr[k]
+        else
+            x[s.rep[k]] = r * xr[k]
+            x[s.partner[k]] = s.coef[k] * r * xr[k]
+        end
+    end
+    return x
+end
+
+"""Full vector -> reduced coordinates by orthogonal projection."""
+function ph_project!(xr::AbstractVector{Float64}, s::Sector, x::AbstractVector{Float64})
+    r = inv(sqrt(2.0))
+    @inbounds for k in eachindex(s.rep)
+        p = s.partner[k]
+        xr[k] = p == 0 ? x[s.rep[k]] : r * (x[s.rep[k]] + s.coef[k] * x[p])
+    end
+    return xr
+end
+
+"""H on the particle-hole half.  The input is expanded to a full vector of
+definite parity; H x then has the same parity, so its reduced coordinates
+follow from the representative entries alone, which are the only rows the
+restricted task list computes."""
+struct PHOperator <: AbstractMatrix{Float64}
+    sector::Sector
+    buffers::Vector{Vector{Float64}}
+    tmps::Vector{Vector{Float64}}
+    ranges::Vector{UnitRange{Int}}
+    x::Vector{Float64}
+    y::Vector{Float64}
+end
+
+PHOperator(s::Sector) = PHOperator(s, workspace(s)..., zeros(s.dim), zeros(s.dim))
+Base.size(op::PHOperator) = (rdim(op.sector), rdim(op.sector))
+Base.size(op::PHOperator, i::Int) = rdim(op.sector)
+LinearAlgebra.ishermitian(::PHOperator) = true
+Base.eltype(::PHOperator) = Float64
+
+function LinearAlgebra.mul!(yr::AbstractVector, op::PHOperator, xr::AbstractVector)
+    s = op.sector
+    ph_expand!(op.x, s, xr)
+    matvec!(op.y, s, op.x, op.buffers, op.tmps, op.ranges)
+    q = sqrt(2.0)
+    @inbounds for k in eachindex(s.rep)
+        yr[k] = s.partner[k] == 0 ? op.y[s.rep[k]] : q * op.y[s.rep[k]]
+    end
+    return yr
+end
+
+"""Diagonal of H in the coupled basis, on the rows of the output channels:
+the channel's diagonal part plus every task whose input channel is its
+output channel, whose block coef R_+ (x) R_- contributes coef R_-[a,a] R_+[b,b]."""
+function hdiag(s::Sector)
+    d = zeros(s.dim)
+    for ch in s.work
+        off, mp, mm = ch.off, ch.mp, ch.mm
+        _, scalar, w_plus, w_minus = s.diagonal[ch.diag]
+        for ap in 1:mp, am in 1:mm
+            d[off+(ap-1)*mm+am] = scalar +
+                (ch.has_w ? w_minus[am, am] + w_plus[ap, ap] : 0.0)
+        end
+        for g in ch.groups, t in eachindex(g.in_off)
+            g.in_off[t] == off || continue
+            rm = g.rm[t]
+            for ap in 1:mp, am in 1:mm
+                d[off+(ap-1)*mm+am] += g.coef[t] * rm[am, am] * g.rp[ap, ap]
+            end
+        end
+    end
+    return d
+end
+
+"""Orthonormalise t against the first m columns of V (block Gram-Schmidt, two
+passes) and store it as column m+1; returns the new size.  A separate function
+rather than a closure, so that m is never captured and boxed.  (The same
+trap cost 30 ms per correction at N = 17 when a convergence comprehension
+captured theta, which is why theta is updated in place.)"""
+function _dav_add!(V, h, t, m)
+    # normalize first, so the linear-dependence cut below is relative: near
+    # convergence at a tight tolerance the Olsen correction itself is ~1e-10,
+    # and an absolute cut on it dropped every new vector and stalled the
+    # iteration until maxiter
+    t0 = norm(t)
+    t0 == 0.0 && return m
+    t ./= t0
+    for _ in 1:2
+        m == 0 && break
+        Vm = view(V, :, 1:m)
+        mul!(view(h, 1:m), Vm', t)
+        mul!(t, Vm, view(h, 1:m), -1.0, 1.0)
+    end
+    nt = norm(t)
+    nt < 1e-10 && return m
+    V[:, m+1] .= t ./ nt
+    return m + 1
+end
+
+"""Block Davidson for the k lowest eigenpairs of a symmetric operator, with the
+diagonal `dg` as preconditioner and Olsen's correction
+    t = -(D - theta)^-1 (r - eps x),  eps = x'(D - theta)^-1 r / x'(D - theta)^-1 x,
+which keeps t from collapsing onto the Ritz vector x when D is a good
+approximation.  Converged when every residual satisfies |r| <= tol |theta|,
+ARPACK's criterion.  The subspace restarts from its `keep` lowest Ritz vectors
+when it reaches `max_dim`; the projected matrix is extended column by column
+and the subspace is never copied, so the cost beyond the matvecs is a few
+passes over n x max_dim numbers per iteration.  Returns (values, vectors,
+matvec count)."""
+function davidson(op, dg::AbstractVector{Float64}; k = 2, tol = 1e-8,
+                  maxiter = 2000, max_dim = max(16k, 32), keep = max(4k, 8),
+                  v0 = nothing)
+    n = size(op, 1)
+    k = min(k, n)
+    max_dim = min(max_dim, n)
+    keep = clamp(keep, k, max_dim - k)
+    V = zeros(n, max_dim)
+    W = zeros(n, max_dim)
+    T = zeros(max_dim, max_dim)
+    X = zeros(n, k)
+    R = zeros(n, k)
+    t = zeros(n)
+    h = zeros(max_dim)
+    m = 0
+    v0 === nothing || (t .= v0; m = _dav_add!(V, h, t, m))
+    for i in partialsortperm(dg, 1:min(n, k + 1))       # lowest diagonal entries
+        m < k && (fill!(t, 0.0); t[i] = 1.0; m = _dav_add!(V, h, t, m))
+    end
+    while m < k
+        t .= randn(n)
+        m = _dav_add!(V, h, t, m)
+    end
+    done = 0                                # columns of W and T already computed
+    nmult = 0
+    theta = zeros(k)
+    converged = falses(k)
+    for _ in 1:maxiter
+        for c in done+1:m
+            mul!(view(W, :, c), op, view(V, :, c))
+            nmult += 1
+            mul!(view(T, 1:c, c), view(V, :, 1:c)', view(W, :, c))
+            T[c, 1:c-1] .= view(T, 1:c-1, c)
+        end
+        done = m
+        F = eigen(Symmetric(T[1:m, 1:m]))
+        theta .= view(F.values, 1:k)             # in place: never rebind theta
+        S = F.vectors[:, 1:k]
+        mul!(X, view(V, :, 1:m), S)
+        mul!(R, view(W, :, 1:m), S)
+        for j in 1:k
+            @views R[:, j] .-= theta[j] .* X[:, j]
+        end
+        for j in 1:k                             # a loop, not a comprehension:
+            converged[j] = norm(view(R, :, j)) <= tol * max(abs(theta[j]), 1.0)
+        end                                      # closures box what they capture
+        all(converged) && return theta, copy(X), nmult
+        if m + count(!, converged) > max_dim             # thick restart
+            Q = F.vectors[:, 1:keep]
+            V[:, 1:keep] .= view(V, :, 1:m) * Q
+            W[:, 1:keep] .= view(W, :, 1:m) * Q
+            fill!(T, 0.0)
+            for c in 1:keep
+                T[c, c] = F.values[c]
+            end
+            m = done = keep
+        end
+        for j in 1:k
+            converged[j] && continue
+            th = theta[j]
+            num = 0.0
+            den = 0.0
+            @inbounds for i in 1:n
+                d = dg[i] - th
+                d = abs(d) < 1e-6 ? copysign(1e-6, d) : d
+                num += X[i, j] * R[i, j] / d
+                den += X[i, j] * X[i, j] / d
+            end
+            eps = num / den
+            @inbounds for i in 1:n
+                d = dg[i] - th
+                d = abs(d) < 1e-6 ? copysign(1e-6, d) : d
+                t[i] = -(R[i, j] - eps * X[i, j]) / d
+            end
+            m = _dav_add!(V, h, t, m)
+        end
+    end
+    @warn "Davidson did not converge" maxiter
+    return theta, copy(X), nmult
+end
+
+"""Lowest k levels of a particle-hole half, with eigenvectors expanded to the
+full coupled basis (so `field_slopes`, `apply_odd_tensor` and the rest take
+them unchanged).  Dense below `dense_limit`, from rdim matvecs."""
+function ph_eigensystem(s::Sector; k = 2, dense_limit = 256, tol = 1e-9,
+                        v0 = nothing, want_vectors = true, solver = :davidson)
+    n = rdim(s)
+    n == 0 && return Float64[], zeros(s.dim, 0)
+    op = PHOperator(s)
+    if n <= dense_limit
+        M = zeros(n, n)
+        e = zeros(n)
+        for c in 1:n
+            e[c] = 1.0
+            mul!(view(M, :, c), op, e)
+            e[c] = 0.0
+        end
+        F = eigen(Symmetric(0.5 .* (M .+ M')))
+        values, reduced = F.values[1:min(k, n)], F.vectors[:, 1:min(k, n)]
+    elseif solver == :davidson
+        start = v0 === nothing ? nothing : ph_project!(zeros(n), s, v0)
+        values, reduced, _ = davidson(op, hdiag(s)[s.rep]; k = k, tol = tol, v0 = start)
+    else
+        HAVE_ARPACK || error("Arpack.jl required for rdim > $dense_limit")
+        kwargs = v0 === nothing ? (;) :
+                 (; v0 = (w = ph_project!(zeros(n), s, v0); w ./ norm(w)))
+        vals, vecs = Arpack.eigs(op; nev = k, which = :SR, tol = tol,
+                                 ncv = min(n - 1, max(20, 20 * k)),
+                                 maxiter = 3000, kwargs...)
+        order = sortperm(real.(vals))
+        values, reduced = real.(vals)[order], real.(vecs)[:, order]
+    end
+    want_vectors || return values, zeros(s.dim, 0)
+    full = zeros(s.dim, length(values))
+    for c in axes(reduced, 2)
+        ph_expand!(view(full, :, c), s, view(reduced, :, c))
+    end
+    return values, full
+end
+
 """`v0`: optional starting vector for the iterative path -- e.g. the
 eigenvector from a nearby coupling during a parameter scan, where the overlap
-is 1 - O(dh^2) and convergence needs only a few matvecs."""
+is 1 - O(dh^2) and convergence needs only a few matvecs.
+
+`solver = :davidson` (default) or `:arpack`.  Both stop at |r| <= tol |E|.
+Davidson with the diagonal of H as preconditioner needs 40-60 matvecs for two
+levels at N = 16-17 where ARPACK (ncv = 40) needs 77-78, and its bookkeeping
+costs about as much as ARPACK's, so it is 1.35-1.8x faster there."""
 function eigenvalues(sector::Sector; k = 2, dense_limit = 4000, tol = 1e-9,
-                     v0 = nothing)
+                     v0 = nothing, solver = :davidson)
+    sector.ph == 0 ||
+        return ph_eigensystem(sector; k = k, dense_limit = min(dense_limit, 256),
+                              tol = tol, v0 = v0, want_vectors = false,
+                              solver = solver)[1]
     sector.dim == 0 && return Float64[]
     if sector.dim <= dense_limit
         matrix = dense(sector)
         return sort(eigvals(Symmetric(0.5 .* (matrix .+ matrix'))))[1:min(k, sector.dim)]
+    end
+    if solver == :davidson
+        op = SectorOperator(sector, workspace(sector)...)
+        return davidson(op, hdiag(sector); k = k, tol = tol, v0 = v0)[1]
     end
     HAVE_ARPACK || error("Arpack.jl required for dim > $dense_limit")
     op = SectorOperator(sector, workspace(sector)...)
@@ -1380,6 +1713,8 @@ end
 
 """Ground state and its vector, warm-startable: the scan workhorse."""
 function ground_state_vector(sector::Sector; tol = 1e-9, v0 = nothing)
+    sector.ph == 0 || return (r = ph_eigensystem(sector; k = 1, tol = tol, v0 = v0);
+                              (r[1][1], r[2][:, 1]))
     if sector.dim <= 4000
         matrix = dense(sector)
         Fv = eigen(Symmetric(0.5 .* (matrix .+ matrix')))
@@ -1404,6 +1739,8 @@ over a probe window; `validate` and the caller can cross-check against
 `eigenvalues` on smaller sectors.
 """
 function ground_state(sector::Sector; tol = 1e-9, maxiter = 2000)
+    sector.ph == 0 || return ph_eigensystem(sector; k = 1, tol = tol,
+                                            want_vectors = false)[1][1]
     buffers, tmps, ranges = workspace(sector)
     n = sector.dim
     v = randn(Random.MersenneTwister(1), n)
@@ -1438,7 +1775,15 @@ end
 
 """Like `eigenvalues` but also returns eigenvectors (columns)."""
 function eigensystem(sector::Sector; k = 2, dense_limit = 4000, tol = 1e-9,
-                     v0 = nothing)
+                     solver = :davidson)
+    sector.ph == 0 ||
+        return ph_eigensystem(sector; k = k, dense_limit = min(dense_limit, 256),
+                              tol = tol, solver = solver)
+    if sector.dim > dense_limit && solver == :davidson
+        op = SectorOperator(sector, workspace(sector)...)
+        values, vectors, _ = davidson(op, hdiag(sector); k = k, tol = tol)
+        return values, vectors
+    end
     if sector.dim <= dense_limit
         matrix = dense(sector)
         F = eigen(Symmetric(0.5 .* (matrix .+ matrix')))
@@ -1447,10 +1792,9 @@ function eigensystem(sector::Sector; k = 2, dense_limit = 4000, tol = 1e-9,
     end
     HAVE_ARPACK || error("Arpack.jl required for dim > $dense_limit")
     op = SectorOperator(sector, workspace(sector)...)
-    kw = (; nev = k, which = :SR, tol = tol,
-          ncv = min(sector.dim - 1, max(20, 20 * k)), maxiter = 3000)
-    values, vectors = v0 === nothing ? Arpack.eigs(op; kw...) :
-                                       Arpack.eigs(op; kw..., v0 = v0)
+    values, vectors = Arpack.eigs(op; nev = k, which = :SR, tol = tol,
+                                  ncv = min(sector.dim - 1, max(20, 20 * k)),
+                                  maxiter = 3000)
     order = sortperm(real.(values))
     return real.(values)[order], real.(vectors)[:, order]
 end
@@ -1473,8 +1817,8 @@ function field_slopes(sector::Sector, vectors::Matrix{Float64})
 end
 
 solve(N, h; V0 = 4.75, V1 = 1.0, L = 0, z2 = +1, k = 2,
-      dense_limit = 4000, n_minus_max = nothing) =
-    eigenvalues(Sector(N, h, V0, V1, L, z2; n_minus_max = n_minus_max);
+      dense_limit = 4000, n_minus_max = nothing, ph = 0) =
+    eigenvalues(Sector(N, h, V0, V1, L, z2; n_minus_max = n_minus_max, ph = ph);
                 k = k, dense_limit = dense_limit)
 
 # =============================================================================
@@ -1625,6 +1969,84 @@ function validate()
         values = solve(N, 3.153; L = L, z2 = z2, k = length(REFERENCE[key]))
         worst = maximum(abs.(values[1:length(REFERENCE[key])] .- REFERENCE[key]))
         check(@sprintf("N = %2d (%d,%+d)", N, L, z2), worst < 3e-5,
+              @sprintf("max |dE| = %.1e", worst))
+    end
+
+    println("7. particle-hole halves (Sector(...; ph = +-1))")
+    let ps = [4.75, 1.0, 0.7, 0.3], worst_c = 0.0, worst_s = 0.0, worst_u = 0.0
+        for N in (8, 9), L in (0, 1, 2, 3), z2 in (1, -1)
+            full = Sector(N, 3.153, ps, L, z2)
+            full.dim == 0 && continue
+            perm, sign = ph_permutation(N, 2L, full.channels, full.offset, full.dim)
+            P = zeros(full.dim, full.dim)
+            for i in 1:full.dim
+                P[perm[i], i] = sign[i]
+            end
+            H = dense(full)
+            worst_c = max(worst_c, maximum(abs, P * H - H * P))
+            worst_s = max(worst_s, maximum(abs, P * P - I))
+            levels = Float64[]
+            for ph in (1, -1)
+                half = Sector(N, 3.153, ps, L, z2; ph = ph)
+                rdim(half) > 0 && append!(levels,
+                    ph_eigensystem(half; k = rdim(half), dense_limit = 10^6,
+                                   want_vectors = false)[1])
+            end
+            e = sort(eigvals(Symmetric(0.5 .* (H .+ H'))))
+            worst_u = max(worst_u, length(levels) == length(e) ?
+                                   maximum(abs.(sort(levels) .- e)) : Inf)
+        end
+        check("N = 8, 9  [H, P] = 0", worst_c < 1e-10, @sprintf("max = %.1e", worst_c))
+        check("N = 8, 9  P^2 = 1", worst_s == 0.0, @sprintf("max = %.1e", worst_s))
+        check("N = 8, 9  the two halves give every level of the block",
+              worst_u < 1e-9, @sprintf("max |dE| = %.1e", worst_u))
+    end
+    # FuzzifiED, L_z = 2, sectors (Z2, P*R_y) with GetParityQNOffd(N,2,[2,1],[-1,1])
+    # * GetRotyQNOffd(N,2); lowest four levels (L >= 2 mixed), h = 3.153, V = (4.75, 1)
+    fz = Dict((8, 1, 1) => [1.992050, 3.597643, 9.373894, 10.390592],
+              (8, 1, -1) => [6.624008, 7.580421, 7.765778, 10.653743],
+              (8, -1, 1) => [-0.346024, 6.712522, 8.086043, 8.108483],
+              (8, -1, -1) => [4.072295, 7.796240, 8.133194, 10.039322],
+              (9, 1, 1) => [-0.224191, 1.414438, 7.387467, 8.263813],
+              (9, 1, -1) => [4.333926, 5.183054, 5.359007, 8.947664],
+              (9, -1, 1) => [-2.383175, 4.911266, 5.587902, 6.127558],
+              (9, -1, -1) => [2.015587, 6.295142, 6.865162, 7.382550])
+    # In two of the eight halves the lowest L = 2 level lies above the four
+    # FuzzifiED levels listed (L = 3, 4 fill the bottom of L_z = 2), so six
+    # levels must be found under their own label and none under the other.
+    let same = 0, other = 0
+        for ((N, z2, ph), ref) in fz
+            e0 = eigenvalues(Sector(N, 3.153, 4.75, 1.0, 2, z2; ph = ph); k = 1)[1]
+            same += any(abs.(ref .- e0) .< 1e-5)
+            other += any(abs.(fz[(N, z2, -ph)] .- e0) .< 1e-5)
+        end
+        check("parity labels == FuzzifiED P R_y (N = 8, 9, L = 2)",
+              same == 6 && other == 0,
+              "$same/6 under the same label, $other under the opposite one")
+    end
+    for key in sort(collect(keys(REFERENCE)))
+        N, L, z2 = key
+        N >= 12 || continue
+        values = solve(N, 3.153; L = L, z2 = z2, k = 2, dense_limit = 64, ph = 1)
+        worst = maximum(abs.(values[1:length(REFERENCE[key])] .- REFERENCE[key]))
+        check(@sprintf("N = %2d (%d,%+d)  ph = +1 half", N, L, z2), worst < 3e-5,
+              @sprintf("max |dE| = %.1e", worst))
+    end
+
+    println("8. Davidson eigensolver against ARPACK")
+    let worst = 0.0, worst_d = 0.0
+        for (N, L, z2, ph) in ((12, 0, 1, 0), (12, 2, -1, 0), (14, 0, 1, 1), (14, 2, 1, 1),
+                               (14, 1, -1, -1))
+            s = Sector(N, 3.153, 4.75, 1.0, L, z2; ph = ph)
+            a = eigenvalues(s; k = 3, dense_limit = 64, tol = 1e-10, solver = :arpack)
+            d = eigenvalues(s; k = 3, dense_limit = 64, tol = 1e-10, solver = :davidson)
+            worst = max(worst, maximum(abs.(a .- d)))
+        end
+        s = Sector(10, 3.153, [4.75, 1.0, 0.7, 0.3], 2, 1)
+        worst_d = maximum(abs, hdiag(s) .- diag(dense(s)))
+        check("diagonal of H == dense diagonal (N = 10)", worst_d < 1e-12,
+              @sprintf("max |d| = %.1e", worst_d))
+        check("three lowest levels, five sectors, N = 12-14", worst < 1e-8,
               @sprintf("max |dE| = %.1e", worst))
     end
 
