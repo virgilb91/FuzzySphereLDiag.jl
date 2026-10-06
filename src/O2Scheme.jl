@@ -8,7 +8,7 @@
 #   HD  = D sum_m c+_m (Sz)^2 c_m,
 #   U^{m1m2m3m4} = sum_l V_l C(s m1, s m2|J M) C(s m4, s m3|J M),  J = 2s - l.
 #
-# Conventions pinned by measurement, not by assertion: the literal bilinear-product
+# The literal bilinear-product
 # Hamiltonian equals the normal-ordered one at anisotropy D + kappa/2 with
 #   kappa = sum_l (-1)^l V_l (2J+1)/(2s+1),
 # verified exactly against FuzzifiED at N = 6, 7.
@@ -282,6 +282,30 @@ end
 
 frame_K(f::O2Frame) = f.K
 
+"""One (J0 group, J0' group) block of a column transform.  Within a frame the
+path columns run over J0 groups, then Jc, with the multiplicity index a0
+fastest, and every path pair of the two groups carries the same reduced
+matrix element r0 times a coupling coefficient that depends only on the two
+Jc.  The block is therefore the Kronecker product S (x) r0, S of size
+(nco, nci), applied as one GEMM over Jc and small ones over a0.  It replaces
+one (coef, r0) entry per path pair: at N = 11, (L, Q) = (2, 0) those were
+1.2e8 entries of ~7 multiply-adds each, 83% of the matvec.
+
+S is stored column-major in its task's `svals` from offset `soff`, not as a
+Matrix of its own: at N = 13, (L, Q) = (2, 0) there are 2e7 blocks, whose
+Matrix headers and allocation slack took more memory than the coefficients."""
+struct O2KronBlock
+    ci::Int32                                    # colstart of the input J0 group
+    co::Int32                                    # colstart of the output J0 group
+    nci::Int32                                   # Jc paths in the input group
+    nco::Int32                                   # Jc paths in the output group
+    soff::Int32                                  # S = svals[soff .+ (1:nco*nci)]
+    r0::Matrix{Float64}                          # (m0', m0), shared reference
+end
+
+"S[oo, ii] of a Kronecker block of task t."
+@inline kron_s(t, b::O2KronBlock, oo, ii) = t.svals[b.soff+(ii-1)*b.nco+oo]
+
 struct O2FrameTask
     fout::Int
     fin::Int
@@ -289,8 +313,35 @@ struct O2FrameTask
     rm::Union{Nothing,Matrix{Float64}}           # (m-', m-)
     # path-diagonal column blocks: (colstart in, colstart out, m0, coef)
     dpairs::Vector{Tuple{Int32,Int32,Int32,Float64}}
-    # (colstart in, colstart out, coef, r0 ref (m0' x m0)) column blocks
-    fentries::Vector{Tuple{Int32,Int32,Float64,Matrix{Float64}}}
+    # Kronecker column blocks S (x) r0 (cross, exchange and transfer pieces)
+    fentries::Vector{O2KronBlock}
+    svals::Vector{Float64}                       # the blocks' S coefficients
+end
+
+"""All (+-) density tasks of one frame pair, summed over the rank lambda.  Each
+of them is path-diagonal, with a coefficient c_lam scalar_coef(J+', J-', J+, J-,
+Jc, lam) that depends on the path only through Jc, so their sum acts on a path
+column as one (mm' mp') x (mm mp) matrix
+    M(Jc) = sum_lam c_lam(Jc) rp_lam (x) rm_lam,
+applied once instead of once per lambda."""
+struct O2PMTask
+    fout::Int
+    fin::Int
+    mats::Vector{Matrix{Float64}}                # M(Jc), one per distinct Jc
+    paths::Vector{NTuple{4,Int32}}               # (colstart in, colstart out, m0, mats index)
+end
+
+
+"""J0 groups of a frame: (2J0, m0, colstart, [2Jc...]) in storage order."""
+function frame_groups(F::O2Frame)
+    groups = Tuple{Int,Int,Int,Vector{Int}}[]
+    for (Jc, J0, m0, cs) in F.cols
+        if isempty(groups) || groups[end][1] != J0
+            push!(groups, (J0, m0, cs, Int[]))
+        end
+        push!(groups[end][4], Jc)
+    end
+    return groups
 end
 
 mutable struct O2Sector
@@ -307,6 +358,40 @@ mutable struct O2Sector
     diag_nd::Vector{Int}                         # d(scalar)/dD per entry
     frames::Vector{O2Frame}
     tasks::Vector{O2FrameTask}
+    pmtasks::Vector{O2PMTask}  # merged (+-) density tasks, sorted by output frame
+    cpar::Int                  # 0: full block; +-1: charge-conjugation parity (Q = 0)
+    rep::Vector{Int}           # reduced basis vector k = (e_rep + coef e_partner)/sqrt2,
+    partner::Vector{Int}       #   or e_rep alone where partner = 0
+    coef::Vector{Float64}
+end
+
+"Dimension of the block actually diagonalised (the C half if cpar != 0)."
+o2_rdim(s::O2Sector) = s.cpar == 0 ? s.dim : length(s.rep)
+
+"""Reduced basis of one charge-conjugation half of a Q = 0 block.  C is the
+signed permutation of `c_operator`: C e_i = sgn_i e_perm(i), exchanging the
+two charged towers.  Kept frames are those with J_+ >= J_-: for J_+ > J_- every
+entry i pairs with its image in the mirror frame, as (e_i + p sgn_i e_perm(i))/sqrt2;
+a frame with J_+ = J_- is its own mirror, its entries with ip < im pair with
+(im, ip), and its entries with ip = im are fixed by C, kept when sgn_i = p."""
+function c_half_basis(channels, offset, parity)
+    rep, partner, coef = Int[], Int[], Float64[]
+    for (n_plus, n_minus, two_J0, two_Jp, two_Jm, two_Jc, m0, mp, mm) in channels
+        two_Jp >= two_Jm || continue
+        off  = offset[(n_plus, n_minus, two_J0, two_Jp, two_Jm, two_Jc)]
+        off2 = offset[(n_minus, n_plus, two_J0, two_Jm, two_Jp, two_Jc)]
+        sg = ((-1.0)^(n_plus * n_minus)) * ((-1.0)^(div(two_Jp + two_Jm - two_Jc, 2)))
+        for i0 in 0:m0-1, ip in 0:mp-1, im in 0:mm-1
+            src = off  + i0 * mp * mm + ip * mm + im + 1
+            dst = off2 + i0 * mm * mp + im * mp + ip + 1
+            if src == dst
+                sg == parity && (push!(rep, src); push!(partner, 0); push!(coef, 0.0))
+            elseif two_Jp > two_Jm || ip < im
+                push!(rep, src); push!(partner, dst); push!(coef, parity * sg)
+            end
+        end
+    end
+    return rep, partner, coef
 end
 
 """Move the sector to anisotropy `D` in place: D enters the Hamiltonian only
@@ -365,7 +450,9 @@ anisotropy D (paper convention already carries the exchange contraction
 pieces explicitly, so the default full set uses no shift)."""
 function O2Sector(N, D, ps_pot::Vector{Float64}, L, Q;
                   pieces = (:pm, :p0, :m0, :same, :xp0, :xm0, :xtr, :d),
-                  d_shift = false, n_pm_max = N)
+                  d_shift = false, n_pm_max = N, cpar = 0, merge_pm = true)
+    cpar in (-1, 0, 1) || error("cpar must be -1, 0 or +1")
+    cpar == 0 || Q == 0 || error("C parity is defined only at Q = 0 (got Q = $Q)")
     orb = orbit(N)
     two_L = 2L
     channels, offset, dim = o2_channels(N, L, Q;
@@ -434,16 +521,30 @@ function O2Sector(N, D, ps_pot::Vector{Float64}, L, Q;
 
     tasks = O2FrameTask[]
     no_dp = Tuple{Int32,Int32,Int32,Float64}[]
-    no_fe = Tuple{Int32,Int32,Float64,Matrix{Float64}}[]
+    no_fe = O2KronBlock[]
+    no_sv = Float64[]                            # shared empties: never mutated
+    groups = [frame_groups(f) for f in frames]
     c_exch = (:xp0 in pieces || :xm0 in pieces) ?
              o2_exchange_coefficients(N, ps_pot) : Dict{Int,Float64}()
+    # The H00 cross density and the Hxy exchange piece of one active flavor are
+    # the same tensor operator sum_mu (-1)^mu T^lam_mu(a) T^lam_-mu(0) with
+    # coefficients c_lambda and c_exch, so each (frame pair, lam) is one task
+    # with the summed coefficient (half the tasks of building them apart).
+    function merged(use_cross, use_exch)
+        out = Dict{Int,Float64}()
+        use_cross && mergewith!(+, out, c_lambda)
+        use_exch && mergewith!(+, out, c_exch)
+        return out
+    end
+    c_p0 = merged(:p0 in pieces, :xp0 in pieces)
+    c_m0 = merged(:m0 in pieces, :xm0 in pieces)
     d_K = :xtr in pieces ? o2_transfer_coefficients(N, ps_pot) :
           Dict{Int,Float64}()
     two_j = N - 1
 
     # ---- two-phase threaded task generation --------------------------------
-    # Work items are (kind, fo, fi, two_lam): kind 1 = pm, 2/3 = cross
-    # spectator :minus/:plus with c_lambda, 4/5 = same with c_exch,
+    # Work items are (kind, fo, fi, two_lam): kind 1 = pm, 2/3 = cross plus
+    # exchange with spectator :minus/:plus (coefficients c_p0 / c_m0),
     # 6 = transfer.  Phase 1 (serial) touches every mutable cache the full
     # pass will need (RMEs, adjoints); phase 2 runs the coefficient math
     # threaded -- its only mutable state is the per-thread 6j cache.
@@ -465,7 +566,68 @@ function O2Sector(N, D, ps_pot::Vector{Float64}, L, Q;
             end
         end
         isempty(dpairs) && return
-        push!(out, O2FrameTask(fo, fi_, rp, rm, dpairs, no_fe))
+        push!(out, O2FrameTask(fo, fi_, rp, rm, dpairs, no_fe, no_sv))
+    end
+
+    # every rank lambda of the (+-) density on one frame pair at once: one
+    # O2PMTask with M(Jc) = sum_lam c_lam(Jc) rp_lam (x) rm_lam when that costs
+    # no more per column than the lambda tasks' row products and there are at
+    # least two ranks; the separate process_pm tasks otherwise.  (Locals are
+    # named apart from the constructor's: a closure shares any variable the
+    # enclosing function also assigns.)
+    function process_pm_frame(fo, fi_, warm, out, outpm)
+        F_o, F_i = frames[fo], frames[fi_]
+        dp_, dm_ = abs(F_o.two_Jp - F_i.two_Jp), abs(F_o.two_Jm - F_i.two_Jm)
+        lamlist = Tuple{Int,Matrix{Float64},Matrix{Float64}}[]
+        for (two_lam, _) in c_lambda
+            (dp_ <= two_lam && dm_ <= two_lam) || continue
+            rp_l = rme_t(orb, F_i.n_plus, two_lam, F_o.two_Jp, F_i.two_Jp)
+            rm_l = rme_t(orb, F_i.n_minus, two_lam, F_o.two_Jm, F_i.two_Jm)
+            (rp_l === nothing || rm_l === nothing) && continue
+            push!(lamlist, (two_lam, rp_l, rm_l))
+        end
+        (warm || isempty(lamlist)) && return
+        nr_o, nr_i = F_o.mm * F_o.mp, F_i.mm * F_i.mp
+        fact = F_o.mm * F_i.mm * F_i.mp + F_o.mm * F_i.mp * F_o.mp
+        if !(merge_pm && length(lamlist) >= 2 &&
+             nr_o * nr_i <= length(lamlist) * min(nr_o * nr_i, fact))
+            for (two_lam, _, _) in lamlist
+                process_pm(fo, fi_, two_lam, c_lambda[two_lam], false, out)
+            end
+            return
+        end
+        krs = [kron(rp_l, rm_l) for (_, rp_l, rm_l) in lamlist]
+        pm_index = Dict{Int,Int}()                   # Jc -> mats index, -1 if zero
+        pm_mats = Matrix{Float64}[]
+        pm_paths = NTuple{4,Int32}[]
+        for (Jc_i, J0_i, m0_i, cs_i) in F_i.cols
+            cs_o = -1
+            for (Jc_o, J0_o, _, cso) in F_o.cols
+                (Jc_o == Jc_i && J0_o == J0_i) && (cs_o = cso; break)
+            end
+            cs_o < 0 && continue
+            idx = get(pm_index, Jc_i, 0)
+            if idx == 0
+                M = zeros(nr_o, nr_i)
+                for (q, (two_lam, _, _)) in enumerate(lamlist)
+                    cl = c_lambda[two_lam] * scalar_coef(F_o.two_Jp, F_o.two_Jm,
+                                                         F_i.two_Jp, F_i.two_Jm, Jc_i, two_lam)
+                    abs(cl) < cut && continue
+                    M .+= cl .* krs[q]
+                end
+                if iszero(M)
+                    idx = -1
+                else
+                    push!(pm_mats, M)
+                    idx = length(pm_mats)
+                end
+                pm_index[Jc_i] = idx
+            end
+            idx < 0 && continue
+            push!(pm_paths, (Int32(cs_i), Int32(cs_o), Int32(m0_i), Int32(idx)))
+        end
+        isempty(pm_paths) && return
+        push!(outpm, O2PMTask(fo, fi_, pm_mats, pm_paths))
     end
 
     # (0,+) / (0,-) densities and exchange: one rme_t on the active tower,
@@ -493,24 +655,45 @@ function O2Sector(N, D, ps_pot::Vector{Float64}, L, Q;
             return
         end
         r_act === nothing && return
-        fentries = Tuple{Int32,Int32,Float64,Matrix{Float64}}[]
-        for (Jc, J0, m0, cs_i) in F_i.cols,
-            (Jc2, J02, m02, cs_o) in F_o.cols
+        blocks = O2KronBlock[]
+        svals = Float64[]
+        # frame part of the chain scalar, per (Jc', Jc), filled on first use
+        lo_i = abs(F_i.two_Jp - F_i.two_Jm)
+        lo_o = abs(F_o.two_Jp - F_o.two_Jm)
+        A = fill(NaN, (F_o.two_Jp + F_o.two_Jm - lo_o) ÷ 2 + 1,
+                 (F_i.two_Jp + F_i.two_Jm - lo_i) ÷ 2 + 1)
+        for (J0, m0, cs_i, Jcs_i) in groups[fi_], (J02, m02, cs_o, Jcs_o) in groups[fo]
             abs(J02 - J0) <= two_lam || continue
             r0 = rme_t(orb, n0, two_lam, J02, J0)
             r0 === nothing && continue
-            coef = c * (spectator == :minus ?
-                chain_scalar_p0(J02, F_o.two_Jp, F_o.two_Jm, Jc2, J0,
-                                F_i.two_Jp, F_i.two_Jm, Jc, two_L,
-                                two_lam) :
-                chain_scalar_m0(J02, F_o.two_Jp, F_o.two_Jm, Jc2, J0,
-                                F_i.two_Jp, F_i.two_Jm, Jc, two_L,
-                                two_lam))
-            abs(coef) * maximum(abs, r0) < cut && continue
-            push!(fentries, (Int32(cs_i), Int32(cs_o), coef, r0))
+            rmax = maximum(abs, r0)
+            S = zeros(length(Jcs_o), length(Jcs_i))
+            for (ii, Jc) in enumerate(Jcs_i), (oo, Jc2) in enumerate(Jcs_o)
+                abs(Jc2 - Jc) <= two_lam <= Jc2 + Jc || continue
+                ia, ja = (Jc2 - lo_o) ÷ 2 + 1, (Jc - lo_i) ÷ 2 + 1
+                a = A[ia, ja]
+                if isnan(a)
+                    a = spectator == :minus ?
+                        chain_frame_p0(F_o.two_Jp, F_o.two_Jm, Jc2,
+                                       F_i.two_Jp, F_i.two_Jm, Jc, two_lam) :
+                        chain_frame_m0(F_o.two_Jp, F_o.two_Jm, Jc2,
+                                       F_i.two_Jp, F_i.two_Jm, Jc, two_lam)
+                    A[ia, ja] = a
+                end
+                a == 0.0 && continue
+                coef = c * a * scalar_coef(Jc2, J02, Jc, J0, two_L, two_lam)
+                abs(coef) * rmax < cut && continue
+                S[oo, ii] = coef
+            end
+            any(!iszero, S) || continue
+            push!(blocks, O2KronBlock(Int32(cs_i), Int32(cs_o), Int32(length(Jcs_i)),
+                                      Int32(length(Jcs_o)), Int32(length(svals)), r0))
+            append!(svals, S)
         end
-        isempty(fentries) && return
-        push!(out, O2FrameTask(fo, fi_, rp, rm, no_dp, fentries))
+        isempty(blocks) && return
+        # exact-size copies: growth slack of the appended vectors was ~2 GB
+        # at N = 13, (L, Q) = (2, 0)
+        push!(out, O2FrameTask(fo, fi_, rp, rm, no_dp, copy(blocks), copy(svals)))
     end
 
     # Hxy pair transfer: (n0 -> n0 - 2, n_+ + 1, n_- + 1) plus adjoint.
@@ -540,64 +723,78 @@ function O2Sector(N, D, ps_pot::Vector{Float64}, L, Q;
             end
             return
         end
-        fentries = Tuple{Int32,Int32,Float64,Matrix{Float64}}[]
-        fadj = Tuple{Int32,Int32,Float64,Matrix{Float64}}[]
-        for (Jc, J0, m0, cs_i) in F_i.cols,
-            (Jc2, J02, m02, cs_o) in F_o.cols
+        fentries = O2KronBlock[]
+        fadj = O2KronBlock[]
+        sv_f = Float64[]
+        sv_a = Float64[]
+        # the 9j of the coupled (+-) RME does not see J0: one table per K,
+        # over (Jc', Jc), filled on first use
+        lo_i = abs(F_i.two_Jp - F_i.two_Jm)
+        lo_o = abs(F_o.two_Jp - F_o.two_Jm)
+        nines = Dict(two_K => fill(NaN, (F_o.two_Jp + F_o.two_Jm - lo_o) ÷ 2 + 1,
+                                   (F_i.two_Jp + F_i.two_Jm - lo_i) ÷ 2 + 1)
+                     for (two_K, _) in d_K)
+        for (J0, m0, cs_i, Jcs_i) in groups[fi_], (J02, m02, cs_o, Jcs_o) in groups[fo]
             for (two_K, d) in d_K
-                abs(Jc2 - Jc) <= two_K <= Jc2 + Jc || continue
                 abs(J02 - J0) <= two_K || continue
                 r0 = rme_y(orb, n0, two_K, J02, J0)
                 r0 === nothing && continue
-                nine = ninej(F_i.two_Jp, F_i.two_Jm, Jc, two_j, two_j,
-                             two_K, F_o.two_Jp, F_o.two_Jm, Jc2)
-                nine == 0.0 && continue
-                coef = d * phase(F_i.n_plus) *
-                       sqrt((Jc + 1.0) * (Jc2 + 1.0) * (two_K + 1.0)) *
-                       nine * scalar_coef(Jc2, J02, Jc, J0, two_L, two_K)
-                abs(coef) * maximum(abs, r0) < cut && continue
-                push!(fentries, (Int32(cs_i), Int32(cs_o), coef, r0))
-                push!(fadj, (Int32(cs_o), Int32(cs_i), coef,
-                             adjoint_of((:ty, N, n0, two_K, J02, J0), r0)))
+                rmax = maximum(abs, r0)
+                S = zeros(length(Jcs_o), length(Jcs_i))
+                tab = nines[two_K]
+                for (ii, Jc) in enumerate(Jcs_i), (oo, Jc2) in enumerate(Jcs_o)
+                    abs(Jc2 - Jc) <= two_K <= Jc2 + Jc || continue
+                    ia, ja = (Jc2 - lo_o) ÷ 2 + 1, (Jc - lo_i) ÷ 2 + 1
+                    nine = tab[ia, ja]
+                    if isnan(nine)
+                        nine = ninej(F_i.two_Jp, F_i.two_Jm, Jc, two_j, two_j,
+                                     two_K, F_o.two_Jp, F_o.two_Jm, Jc2)
+                        tab[ia, ja] = nine
+                    end
+                    nine == 0.0 && continue
+                    coef = d * phase(F_i.n_plus) *
+                           sqrt((Jc + 1.0) * (Jc2 + 1.0) * (two_K + 1.0)) *
+                           nine * scalar_coef(Jc2, J02, Jc, J0, two_L, two_K)
+                    abs(coef) * rmax < cut && continue
+                    S[oo, ii] = coef
+                end
+                any(!iszero, S) || continue
+                push!(fentries, O2KronBlock(Int32(cs_i), Int32(cs_o), Int32(length(Jcs_i)),
+                                            Int32(length(Jcs_o)), Int32(length(sv_f)), r0))
+                append!(sv_f, S)
+                push!(fadj, O2KronBlock(Int32(cs_o), Int32(cs_i), Int32(length(Jcs_o)),
+                                        Int32(length(Jcs_i)), Int32(length(sv_a)),
+                                        adjoint_of((:ty, N, n0, two_K, J02, J0), r0)))
+                append!(sv_a, permutedims(S))
             end
         end
         isempty(fentries) && return
-        push!(out, O2FrameTask(fo, fi_, rp, rm, no_dp, fentries))
+        push!(out, O2FrameTask(fo, fi_, rp, rm, no_dp, copy(fentries), copy(sv_f)))
         push!(out, O2FrameTask(
             fi_, fo,
             adjoint_of((:rc, N, F_i.n_plus, F_o.two_Jp, F_i.two_Jp), rp),
             adjoint_of((:rc, N, F_i.n_minus, F_o.two_Jm, F_i.two_Jm), rm),
-            no_dp, fadj))
+            no_dp, copy(fadj), copy(sv_a)))
     end
 
-    process(kind, fo, fi_, lam, warm, out) =
-        kind == 1 ? process_pm(fo, fi_, lam, c_lambda[lam], warm, out) :
-        kind == 2 ? process_cross(:minus, fo, fi_, lam, c_lambda[lam],
-                                  warm, out) :
-        kind == 3 ? process_cross(:plus, fo, fi_, lam, c_lambda[lam],
-                                  warm, out) :
-        kind == 4 ? process_cross(:minus, fo, fi_, lam, c_exch[lam],
-                                  warm, out) :
-        kind == 5 ? process_cross(:plus, fo, fi_, lam, c_exch[lam],
-                                  warm, out) :
+    process(kind, fo, fi_, lam, warm, out, outpm) =
+        kind == 1 ? process_pm_frame(fo, fi_, warm, out, outpm) :
+        kind == 2 ? process_cross(:minus, fo, fi_, lam, c_p0[lam], warm, out) :
+        kind == 3 ? process_cross(:plus, fo, fi_, lam, c_m0[lam], warm, out) :
         process_transfer(fo, fi_, warm, out)
 
     # collect work items with cheap J-triangle guards only
     items = NTuple{4,Int}[]
+    # a C half needs only the rows of the frames with J_+ >= J_-
+    keep(F) = cpar == 0 || F.two_Jp >= F.two_Jm
     for (_, group) in by_blockf, fo in group, fi_ in group
         F_o, F_i = frames[fo], frames[fi_]
+        keep(F_o) || continue
         dJp, dJm = abs(F_o.two_Jp - F_i.two_Jp), abs(F_o.two_Jm - F_i.two_Jm)
-        if :pm in pieces
-            for (two_lam, _) in c_lambda
-                (dJp <= two_lam && dJm <= two_lam) &&
-                    push!(items, (1, fo, fi_, two_lam))
-            end
-        end
-        for (kind, cd, spec) in ((2, c_lambda, :minus), (3, c_lambda, :plus),
-                                 (4, c_exch, :minus), (5, c_exch, :plus))
-            piece = kind == 2 ? :p0 : kind == 3 ? :m0 :
-                    kind == 4 ? :xp0 : :xm0
-            piece in pieces || continue
+        :pm in pieces &&                         # one item per frame pair
+            any(dJp <= l && dJm <= l for l in keys(c_lambda)) &&
+            push!(items, (1, fo, fi_, 0))
+        for (kind, cd, spec) in ((2, c_p0, :minus), (3, c_m0, :plus))
             (spec == :minus ? dJm : dJp) == 0 || continue
             dact = spec == :minus ? dJp : dJm
             for (two_lam, _) in cd
@@ -611,35 +808,45 @@ function O2Sector(N, D, ps_pot::Vector{Float64}, L, Q;
             N - F_i.n_plus - F_i.n_minus >= 2 || continue
             for fo in get(by_blockf, (F_i.n_plus + 1, F_i.n_minus + 1),
                           Int[])
-                push!(items, (6, fo, fi_, 0))
+                (keep(frames[fo]) || keep(F_i)) &&     # makes both directions
+                    push!(items, (6, fo, fi_, 0))
             end
         end
     end
 
     # phase 1 (serial): warm every cache the threaded pass reads
     for (kind, fo, fi_, lam) in items
-        process(kind, fo, fi_, lam, true, tasks)
+        process(kind, fo, fi_, lam, true, tasks, O2PMTask[])
     end
     # phase 2 (threaded): coefficient math; per-thread 6j caches, all other
     # caches now read-only
     nt = max(1, Threads.nthreads())
     lists = [O2FrameTask[] for _ in 1:nt]
+    pmlists = [O2PMTask[] for _ in 1:nt]
     Threads.@threads :static for w in 1:nt
-        for idx in w:nt:length(items)
-            kind, fo, fi_, lam = items[idx]
-            process(kind, fo, fi_, lam, false, lists[w])
+        for it in w:nt:length(items)
+            kind, fo, fi_, lam = items[it]
+            process(kind, fo, fi_, lam, false, lists[w], pmlists[w])
         end
     end
     for l in lists
         append!(tasks, l)
     end
-    merge_wigner_caches!()           # later builds hit the shared 6j and CG caches
+    pmtasks = reduce(vcat, pmlists; init = O2PMTask[])
+    sort!(pmtasks; by = t -> (t.fout, t.fin))
+    cpar == 0 || filter!(t -> keep(frames[t.fout]), tasks)
+    merge_sixj_caches!()             # later builds hit the shared 6j cache
     # restore frame-ordered task layout: the strided threading interleaves
     # tasks, which destroys matvec cache locality (measured 1.13 -> 1.8 s)
     sort!(tasks; by = t -> (t.fout, t.fin))
 
+    CACHE_DIR[] === nothing || save_tables(N)
+    # (names chosen not to collide with the closures' locals: a closure that
+    # assigns a name the enclosing function also assigns shares that variable)
+    half_basis = cpar == 0 ? (Int[], Int[], Float64[]) :
+                 c_half_basis(channels, offset, cpar)
     return O2Sector(N, D, L, Q, dim, channels, offset, diagonal, diag_nd,
-                    frames, tasks)
+                    frames, tasks, pmtasks, cpar, half_basis...)
 end
 
 # -----------------------------------------------------------------------------
@@ -656,16 +863,42 @@ the tensor on one pair member is [T^k x 1]^k with the coupled-RME 9j formula
 adjacent-chain scalar_coef.  Not cached: the key space is per path pair (it
 overwhelmed memory as a cache) while the 9j itself memoises its 6j parts.
 `chain_scalar_generic` (explicit CG sums) remains as the reference;
-o2_validate cross-checks the two on random samples."""
+o2_validate cross-checks the two on random samples.
+
+The chain scalar factors into a part fixed by the frame pair (the 9j, which
+does not see J0) and the path-dependent scalar_coef; `chain_frame_p0/m0` is the
+first part, so a task can tabulate it once per (Jc, Jc') instead of once per
+path pair.  Its 9j has a zero entry and is a single 6j (`ninej_zero22/21`)."""
 chain_scalar_p0(J0_o, Jp_o, Jm, Jc_o, J0_i, Jp_i, Jm_i, Jc_i, two_L, two_k) =
-    sqrt((Jc_i + 1.0) * (Jc_o + 1.0) * (two_k + 1.0) * (Jm_i + 1.0)) *
-    ninej(Jp_i, Jm_i, Jc_i, two_k, 0, two_k, Jp_o, Jm_i, Jc_o) *
+    chain_frame_p0(Jp_o, Jm, Jc_o, Jp_i, Jm_i, Jc_i, two_k) *
     scalar_coef(Jc_o, J0_o, Jc_i, J0_i, two_L, two_k)
 
 chain_scalar_m0(J0_o, Jp, Jm_o, Jc_o, J0_i, Jp_i, Jm_i, Jc_i, two_L, two_k) =
-    sqrt((Jc_i + 1.0) * (Jc_o + 1.0) * (two_k + 1.0) * (Jp_i + 1.0)) *
-    ninej(Jp_i, Jm_i, Jc_i, 0, two_k, two_k, Jp_i, Jm_o, Jc_o) *
+    chain_frame_m0(Jp, Jm_o, Jc_o, Jp_i, Jm_i, Jc_i, two_k) *
     scalar_coef(Jc_o, J0_o, Jc_i, J0_i, two_L, two_k)
+
+chain_frame_p0(Jp_o, Jm, Jc_o, Jp_i, Jm_i, Jc_i, two_k) =
+    sqrt((Jc_i + 1.0) * (Jc_o + 1.0) * (two_k + 1.0) * (Jm_i + 1.0)) *
+    ninej_zero22(Jp_i, Jm_i, Jc_i, two_k, two_k, Jp_o, Jm_i, Jc_o)
+
+chain_frame_m0(Jp, Jm_o, Jc_o, Jp_i, Jm_i, Jc_i, two_k) =
+    sqrt((Jc_i + 1.0) * (Jc_o + 1.0) * (two_k + 1.0) * (Jp_i + 1.0)) *
+    ninej_zero21(Jp_i, Jm_i, Jc_i, two_k, two_k, Jp_i, Jm_o, Jc_o)
+
+"""9j symbols with one zero entry, as a single 6j (doubled arguments):
+    {a b c; d 0 f; g h i} = d_bh d_df (-1)^(b+c+d+g) {a c b; i g d} / sqrt((2b+1)(2d+1))
+    {a b c; 0 e f; g h i} = d_ag d_ef (-1)^(a+b+f+i) {c b a; h i f} / sqrt((2a+1)(2f+1))
+Both follow from the corner case {j1 j2 j3; j4 j5 j3; j7 j7 0} = (-1)^(j2+j3+j4+j7)
+{j1 j2 j3; j5 j4 j7} / sqrt((2j3+1)(2j7+1)) after one row and one column
+exchange, which together leave a 9j unchanged.  o2_validate compares both with
+the general `ninej`."""
+ninej_zero22(a, b, c, d, f, g, h, i) =
+    (b == h && d == f) ?
+    phase((b + c + d + g) ÷ 2) * sixj(a, c, b, i, g, d) / sqrt((b + 1.0) * (d + 1.0)) : 0.0
+
+ninej_zero21(a, b, c, e, f, g, h, i) =
+    (a == g && e == f) ?
+    phase((a + b + f + i) ÷ 2) * sixj(c, b, a, h, i, f) / sqrt((a + 1.0) * (f + 1.0)) : 0.0
 
 """Explicit construction: couple (J+ J-)Jc then (Jc J0)L at M = L; apply
 T^k(active) T^k(0) as CG-expanded single-tensor actions on the m-components;
@@ -711,6 +944,7 @@ end
 # -----------------------------------------------------------------------------
 
 function dense_o2(sector::O2Sector)
+    sector.cpar == 0 || error("dense_o2 needs the full block; build it with cpar = 0")
     matrix = zeros(sector.dim, sector.dim)
     eye(n) = Matrix{Float64}(I, n, n)
     for (off, scalar, w0, wp, wm) in sector.diagonal
@@ -736,13 +970,25 @@ function dense_o2(sector::O2Sector)
                 add!(co + a, ci + a, c)
             end
         end
-        for (ci, co, c, r0) in t.fentries
-            m0o_, m0i_ = size(r0)
-            for a0i in 1:m0i_, a0o in 1:m0o_
-                v = c * r0[a0o, a0i]
-                v == 0.0 && continue
-                add!(co + a0o, ci + a0i, v)
+        for b in t.fentries
+            m0o_, m0i_ = size(b.r0)
+            for ii in 1:b.nci, oo in 1:b.nco
+                sc = kron_s(t, b, oo, ii)
+                sc == 0.0 && continue
+                for a0i in 1:m0i_, a0o in 1:m0o_
+                    v = sc * b.r0[a0o, a0i]
+                    v == 0.0 && continue
+                    add!(b.co + (oo - 1) * m0o_ + a0o, b.ci + (ii - 1) * m0i_ + a0i, v)
+                end
             end
+        end
+    end
+    for t in sector.pmtasks
+        F_o, F_i = sector.frames[t.fout], sector.frames[t.fin]
+        so, si = F_o.mm * F_o.mp, F_i.mm * F_i.mp
+        for (ci, co, m0w, k) in t.paths, a in 1:m0w
+            matrix[F_o.offset+(co+a-1)*so+1:F_o.offset+(co+a)*so,
+                   F_i.offset+(ci+a-1)*si+1:F_i.offset+(ci+a)*si] .+= t.mats[k]
         end
     end
     return matrix
@@ -757,128 +1003,240 @@ o2_eigenvalues(sector::O2Sector; k = 6) =
 # Iterative path: matvec over tasks (three-index contraction), Arpack solver
 # -----------------------------------------------------------------------------
 
-"""out[a, c, b] = in[a, b, c] for in of shape (A, B, C): the middle-to-last
-permutation that turns the plus-contraction into one large GEMM."""
-@inline function _permute23!(out, inp, A, B, C)
+"""out[ooff + (a, c, b)] = in[ioff + (a, b, c)] for in of shape (A, B, C): the
+middle-to-last permutation that turns the plus-contraction into one GEMM."""
+@inline function _permute23!(out, ooff, inp, ioff, A, B, C)
     @inbounds for c in 1:C, b in 1:B
-        src = (c - 1) * A * B + (b - 1) * A
-        dst = (b - 1) * A * C + (c - 1) * A
+        src = ioff + (c - 1) * A * B + (b - 1) * A
+        dst = ooff + (b - 1) * A * C + (c - 1) * A
         @simd for a in 1:A
             out[dst+a] = inp[src+a]
         end
     end
 end
 
-"""y += (rp (x) rm) x (column transform)  on one frame pair; frame data is
-the (m_- m_+) x (m0 nJc) path matrix.  `nothing` row factors are identities.
-Middle-index contractions are reached by cheap permutations so every GEMM
-has a fat dimension.  The column transform is path-diagonal blocks
-(dpairs) or (coef x r0-reference) blocks (fentries).  `s1..s3` are
-caller-owned scratch vectors (thread-private)."""
-function _apply_frame_task!(y, x, t::O2FrameTask, F_o::O2Frame, F_i::O2Frame,
-                            s1, s2, s3)
-    mmi, mpi, Kin = F_i.mm, F_i.mp, frame_K(F_i)
-    mmo, mpo, Kout = F_o.mm, F_o.mp, frame_K(F_o)
-    X = reshape(view(x, F_i.offset+1:F_i.offset+mmi*mpi*Kin), mmi, mpi * Kin)
-    if t.rm === nothing
-        T1 = X                                   # (mmi = mmo, mpi * Kin)
-    else
-        T1 = reshape(view(s1, 1:mmo*mpi*Kin), mmo, mpi * Kin)
-        mul!(T1, t.rm, X)
+"""Multiply-adds per path column of the factorized row product (rm, then rp)."""
+_row_flops(t, F_o, F_i) =
+    (t.rm === nothing ? 0 : F_o.mm * F_i.mm * F_i.mp) +
+    (t.rp === nothing ? 0 : F_o.mm * F_i.mp * F_o.mp)
+
+"""T3 = (rp (x) rm) X_in for one task, an (mm' mp') x K_in block at the start of
+`s3`.  With `rr` (the explicit Kronecker product, used when the row factors are
+small, which they are for nearly every task: mm mp is 2 at the median and 16 at
+most at N = 11) it is one GEMM; otherwise rm, then rp through the middle-index
+permutations.  Every product goes through the in-house kernel `_gemm!`.
+OpenBLAS called from many Julia threads serializes on its buffer pool, which had
+left the 8-thread matvec no faster than one thread (N = 11, (L, Q) = (0, 0):
+0.119 s against 0.126 s)."""
+function _row_factor!(s3, x, t::O2FrameTask, rr, F_o::O2Frame, F_i::O2Frame, s1, s2)
+    mmi, mpi, Kin = F_i.mm, F_i.mp, F_i.K
+    mmo, mpo = F_o.mm, F_o.mp
+    nr, nri = mmo * mpo, mmi * mpi
+    if rr !== nothing
+        @inbounds for i in 1:nr*Kin
+            s3[i] = 0.0
+        end
+        _gemm!(s3, 0, nr, Kin, rr, 0, nr, x, F_i.offset, 1, nri, nri, 1.0)
+        return nothing
     end
-    if t.rp === nothing
-        T3 = reshape(T1, mmo * mpo, Kin)         # mpi == mpo
-    else
-        P = view(s2, 1:mmo*mpi*Kin)
-        _permute23!(P, T1, mmo, mpi, Kin)
-        Q = reshape(view(s1, 1:mmo*Kin*mpo), mmo * Kin, mpo)
-        mul!(Q, reshape(P, mmo * Kin, mpi), transpose(t.rp))
-        T3v = view(s3, 1:mmo*mpo*Kin)
-        _permute23!(T3v, Q, mmo, Kin, mpo)
-        T3 = reshape(T3v, mmo * mpo, Kin)
+    if t.rm === nothing                          # T1 = X (mmi == mmo)
+        src, soff = x, F_i.offset
+    else                                         # T1 = rm X, (mmo, mpi Kin)
+        @inbounds for i in 1:mmo*mpi*Kin
+            s1[i] = 0.0
+        end
+        _gemm!(s1, 0, mmo, mpi * Kin, t.rm, 0, mmo, x, F_i.offset, 1, mmi, mmi, 1.0)
+        src, soff = s1, 0
     end
-    nr = mmo * mpo
-    Y = reshape(view(y, F_o.offset+1:F_o.offset+nr*Kout), nr, Kout)
+    if t.rp === nothing                          # T3 = T1 (mpi == mpo)
+        copyto!(s3, 1, src, soff + 1, nr * Kin)
+        return nothing
+    end
+    _permute23!(s2, 0, src, soff, mmo, mpi, Kin)  # (mmo, Kin, mpi)
+    @inbounds for i in 1:mmo*Kin*mpo
+        s1[i] = 0.0
+    end
+    _gemm!(s1, 0, mmo * Kin, mpo, s2, 0, mmo * Kin, t.rp, 0, mpo, 1, mpi, 1.0)
+    _permute23!(s3, 0, s1, 0, mmo, Kin, mpo)      # (mmo, mpo, Kin)
+    return nothing
+end
+
+"""y += (rp (x) rm) x (column transform) on one frame pair; frame data is the
+(m_- m_+) x (m0 nJc) path matrix.  The column transform is path-diagonal blocks
+(dpairs) or Kronecker blocks S (x) r0 (fentries).  `s1..s4` are the caller's
+scratch vectors."""
+function _apply_frame_task!(y, x, t::O2FrameTask, rr, F_o::O2Frame, F_i::O2Frame,
+                            s1, s2, s3, s4)
+    _row_factor!(s3, x, t, rr, F_o, F_i, s1, s2)
+    nr = F_o.mm * F_o.mp
+    yoff = F_o.offset
     @inbounds for (ci, co, m0w, c) in t.dpairs
         for a in 1:m0w
-            col_i, col_o = ci + a, co + a
+            yo = yoff + (co + a - 1) * nr
+            xo = (ci + a - 1) * nr
             @simd for r in 1:nr
-                Y[r, col_o] += c * T3[r, col_i]
+                y[yo+r] += c * s3[xo+r]
             end
         end
     end
-    @inbounds for (ci, co, c, r0) in t.fentries
-        m0o_, m0i_ = size(r0)
-        for a0i in 1:m0i_
-            col_i = ci + a0i
-            for a0o in 1:m0o_
-                v = c * r0[a0o, a0i]
-                v == 0.0 && continue
-                col_o = co + a0o
-                @simd for r in 1:nr
-                    Y[r, col_o] += v * T3[r, col_i]
-                end
+    # Kronecker blocks: Y[:, (a0', jc')] += sum S[jc', jc] r0[a0', a0] T3[:, (a0, jc)]
+    for b in t.fentries
+        m0o_, m0i_ = size(b.r0)
+        nci, nco = Int(b.nci), Int(b.nco)
+        if m0o_ == 1 && m0i_ == 1                # one GEMM over Jc, r0 as a scalar
+            _gemm!(y, yoff + b.co * nr, nr, nco, s3, b.ci * nr, nr,
+                   t.svals, b.soff, nco, 1, nci, b.r0[1, 1])
+        else                                     # Jc first, then a0 per output path
+            w = nr * m0i_
+            @inbounds for i in 1:w*nco
+                s4[i] = 0.0
+            end
+            _gemm!(s4, 0, w, nco, s3, b.ci * nr, w, t.svals, b.soff, nco, 1, nci, 1.0)
+            for jo in 1:nco
+                _gemm!(y, yoff + (b.co + (jo - 1) * m0o_) * nr, nr, m0o_,
+                       s4, (jo - 1) * w, nr, b.r0, 0, m0o_, 1, m0i_, 1.0)
             end
         end
     end
     return nothing
 end
 
-struct O2Operator <: AbstractMatrix{Float64}
-    sector::O2Sector
-    ranges::Vector{UnitRange{Int}}               # flop-balanced task ranges
-    buffers::Vector{Vector{Float64}}             # per-thread outputs
-    s1s::Vector{Vector{Float64}}                 # per-thread scratch
-    s2s::Vector{Vector{Float64}}
-    s3s::Vector{Vector{Float64}}
+"""y = (channel-diagonal part) x on the channels `chans` of one frame: the
+scalar, then W_- and W_+ on the charged multiplicity indices and W_0 on the
+neutral one (all three symmetric), through `_gemm!` like the tasks."""
+function _apply_frame_diagonal!(y, x, sector, chans)
+    @inbounds for i in chans
+        off, scalar, w0, wp, wm = sector.diagonal[i]
+        m0, mp, mm = size(w0, 1), size(wp, 1), size(wm, 1)
+        for j in off+1:off+mm*mp*m0
+            y[j] = scalar * x[j]
+        end
+        _gemm!(y, off, mm, mp * m0, wm, 0, mm, x, off, 1, mm, mm, 1.0)
+        for a0 in 1:m0
+            o = off + (a0 - 1) * mm * mp
+            _gemm!(y, o, mm, mp, x, o, mm, wp, 0, 1, mp, mp, 1.0)
+        end
+        _gemm!(y, off, mm * mp, m0, x, off, mm * mp, w0, 0, 1, m0, m0, 1.0)
+    end
+    return nothing
 end
 
-function O2Operator(sector::O2Sector)
-    frames = sector.frames
-    flops = Float64[]
-    max1 = max2 = max3 = 1
-    for t in sector.tasks
+"""H x over output frames.  Each frame is a disjoint block of rows, so workers
+take whole frames from a shared counter, largest first, and write y directly:
+the diagonal channels of the frame first, then every task whose output is the
+frame.  No per-thread copies of y, no reduction, and no static split whose
+slowest part sets the pace (the flop-balanced static ranges this replaces were
+3-4x out of balance, because tiny tasks cost far more than their flops)."""
+struct O2Operator <: AbstractMatrix{Float64}
+    sector::O2Sector
+    rr::Vector{Union{Nothing,Matrix{Float64}}}  # explicit row factor per task
+    ftasks::Vector{UnitRange{Int}}               # tasks by output frame
+    fpm::Vector{UnitRange{Int}}                  # merged (+-) tasks by output frame
+    fdiag::Vector{UnitRange{Int}}                # diagonal channels by frame
+    order::Vector{Int}                           # frames, most work first
+    s1s::Vector{Vector{Float64}}                 # per-worker scratch
+    s2s::Vector{Vector{Float64}}
+    s3s::Vector{Vector{Float64}}
+    s4s::Vector{Vector{Float64}}
+end
+
+function O2Operator(sector::O2Sector;
+                    frames_out = [f for (f, F) in enumerate(sector.frames)
+                                  if sector.cpar == 0 || F.two_Jp >= F.two_Jm],
+                    rows = :auto)
+    rows in (:auto, :explicit, :factorized) || error("rows = :auto, :explicit or :factorized")
+    frames, tasks = sector.frames, sector.tasks
+    issorted(tasks; by = t -> t.fout) || error("tasks must be sorted by output frame")
+    nf = length(frames)
+    # diagonal channels per frame: frames are maximal runs of channels
+    fdiag = Vector{UnitRange{Int}}(undef, nf)
+    let f = 1, start = 1, chs = sector.channels
+        for c in 2:length(chs)+1
+            if c > length(chs) || chs[c][[1, 2, 4, 5]] != chs[c-1][[1, 2, 4, 5]]
+                sector.diagonal[start][1] == frames[f].offset ||
+                    error("frame/channel layout mismatch at frame $f")
+                fdiag[f] = start:c-1
+                f += 1
+                start = c
+            end
+        end
+        f == nf + 1 || error("frame count mismatch")
+    end
+    ftasks = fill(1:0, nf)
+    let i = 1
+        while i <= length(tasks)
+            j = i
+            while j < length(tasks) && tasks[j+1].fout == tasks[i].fout
+                j += 1
+            end
+            ftasks[tasks[i].fout] = i:j
+            i = j + 1
+        end
+    end
+    fpm = fill(1:0, nf)
+    let pms = sector.pmtasks, i = 1
+        while i <= length(pms)
+            j = i
+            while j < length(pms) && pms[j+1].fout == pms[i].fout
+                j += 1
+            end
+            fpm[pms[i].fout] = i:j
+            i = j + 1
+        end
+    end
+    rr = Vector{Union{Nothing,Matrix{Float64}}}(nothing, length(tasks))
+    cache = Dict{NTuple{6,UInt},Matrix{Float64}}()
+    work = zeros(nf)
+    max1 = max2 = max3 = max4 = 1
+    eye(n) = Matrix{Float64}(I, n, n)
+    for (k, t) in enumerate(tasks)
         F_o, F_i = frames[t.fout], frames[t.fin]
         mmi, mpi, Kin = F_i.mm, F_i.mp, F_i.K
         mmo, mpo = F_o.mm, F_o.mp
-        nr = mmo * mpo
+        nr, nri = mmo * mpo, mmi * mpi
+        fact = _row_flops(t, F_o, F_i)
         f = 0.0
-        t.rm !== nothing && (f += mmo * mmi * mpi * Kin;
-                             max1 = max(max1, mmo * mpi * Kin))
-        if t.rp !== nothing
-            f += mmo * mpi * mpo * Kin
-            max1 = max(max1, mmo * Kin * mpo)
+        explicit = rows == :auto ? nr * nri <= max(64, 2 * fact) : rows == :explicit
+        if explicit                                       # explicit Kronecker
+            key = (t.rp === nothing ? UInt(0) : objectid(t.rp),
+                   t.rm === nothing ? UInt(0) : objectid(t.rm),
+                   UInt(mpo), UInt(mpi), UInt(mmo), UInt(mmi))
+            rr[k] = get!(cache, key) do
+                kron(t.rp === nothing ? eye(mpo) : t.rp,
+                     t.rm === nothing ? eye(mmo) : t.rm)
+            end
+            f += nr * nri * Kin
+        else
+            f += fact * Kin
+            max1 = max(max1, mmo * mpi * Kin, mmo * Kin * mpo)
             max2 = max(max2, mmo * mpi * Kin)
-            max3 = max(max3, mmo * mpo * Kin)
         end
+        max3 = max(max3, nr * Kin)
         for (_, _, m0w, _) in t.dpairs
             f += nr * m0w
         end
-        for (_, _, _, r0) in t.fentries
-            f += nr * length(r0)
+        for b in t.fentries
+            m0o_, m0i_ = size(b.r0)
+            f += nr * m0i_ * b.nci * b.nco + (length(b.r0) > 1 ? nr * m0i_ * m0o_ * b.nco : 0)
+            max4 = max(max4, nr * m0i_ * b.nco)
         end
-        push!(flops, f)
+        work[t.fout] += f + 200.0                         # + per-task overhead
     end
-    nthreads = max(1, Threads.nthreads())
-    target = sum(flops) / nthreads
-    ranges = UnitRange{Int}[]
-    start, load = 1, 0.0
-    for (t, f) in enumerate(flops)
-        load += f
-        if load >= target && length(ranges) < nthreads - 1
-            push!(ranges, start:t)
-            start, load = t + 1, 0.0
+    for fi in 1:nf
+        F = frames[fi]
+        work[fi] += F.mm * F.mp * F.K * (F.mm + F.mp + 8)
+    end
+    for t in sector.pmtasks
+        F_o, F_i = frames[t.fout], frames[t.fin]
+        for (_, _, m0w, _) in t.paths
+            work[t.fout] += F_o.mm * F_o.mp * F_i.mm * F_i.mp * m0w + 50.0
         end
     end
-    push!(ranges, start:length(sector.tasks))
-    while length(ranges) < nthreads
-        push!(ranges, 1:0)
-    end
-    return O2Operator(sector, ranges,
-                      [zeros(sector.dim) for _ in 1:nthreads],
-                      [zeros(max1) for _ in 1:nthreads],
-                      [zeros(max2) for _ in 1:nthreads],
-                      [zeros(max3) for _ in 1:nthreads])
+    order = [f for f in sortperm(work; rev = true) if f in frames_out]
+    nw = max(1, Threads.nthreads())
+    return O2Operator(sector, rr, ftasks, fpm, fdiag, order,
+                      [zeros(max1) for _ in 1:nw], [zeros(max2) for _ in 1:nw],
+                      [zeros(max3) for _ in 1:nw], [zeros(max4) for _ in 1:nw])
 end
 
 Base.size(op::O2Operator) = (op.sector.dim, op.sector.dim)
@@ -886,60 +1244,214 @@ Base.size(op::O2Operator, i::Int) = op.sector.dim
 Base.eltype(::O2Operator) = Float64
 LinearAlgebra.ishermitian(::O2Operator) = true
 
-function LinearAlgebra.mul!(y::AbstractVector, op::O2Operator,
-                            x::AbstractVector)
+function _apply_frame!(y, x, op::O2Operator, f, s1, s2, s3, s4)
     sector = op.sector
-    tasks = sector.tasks
-    frames = sector.frames
-    nthreads = length(op.buffers)
-    Threads.@threads :static for w in 1:nthreads
-        buffer = op.buffers[w]
-        fill!(buffer, 0.0)
-        s1, s2, s3 = op.s1s[w], op.s2s[w], op.s3s[w]
-        for t in op.ranges[w]
-            task = tasks[t]
-            _apply_frame_task!(buffer, x, task, frames[task.fout],
-                               frames[task.fin], s1, s2, s3)
+    frames, tasks = sector.frames, sector.tasks
+    _apply_frame_diagonal!(y, x, sector, op.fdiag[f])
+    for k in op.ftasks[f]
+        t = tasks[k]
+        _apply_frame_task!(y, x, t, op.rr[k], frames[t.fout], frames[t.fin],
+                           s1, s2, s3, s4)
+    end
+    for k in op.fpm[f]
+        t = sector.pmtasks[k]
+        F_o, F_i = frames[t.fout], frames[t.fin]
+        nr, nri = F_o.mm * F_o.mp, F_i.mm * F_i.mp
+        for (ci, co, m0w, j) in t.paths                 # Y[:, co+a] += M(Jc) X[:, ci+a]
+            _gemm!(y, F_o.offset + co * nr, nr, m0w, t.mats[j], 0, nr,
+                   x, F_i.offset + ci * nri, 1, nri, nri, 1.0)
         end
     end
-    fill!(y, 0.0)
-    for buffer in op.buffers
-        y .+= buffer
-    end
-    # channel-diagonal part: disjoint y slices, threaded over channels
-    Threads.@threads :static for i in eachindex(sector.diagonal)
-        off, scalar, w0, wp, wm = sector.diagonal[i]
-        m0, mp, mm = size(w0, 1), size(wp, 1), size(wm, 1)
-        X = reshape(view(x, off+1:off+mm*mp*m0), mm, mp, m0)
-        Y = reshape(view(y, off+1:off+mm*mp*m0), mm, mp, m0)
-        Y .+= scalar .* X
-        for a0 in 1:m0
-            mul!(view(Y, :, :, a0), wm, view(X, :, :, a0), 1.0, 1.0)
-            mul!(view(Y, :, :, a0), view(X, :, :, a0), wp, 1.0, 1.0)
+    return nothing
+end
+
+function LinearAlgebra.mul!(y::AbstractVector, op::O2Operator, x::AbstractVector)
+    next = Threads.Atomic{Int}(1)
+    order = op.order
+    @sync for w in eachindex(op.s1s)
+        Threads.@spawn begin
+            s1, s2, s3, s4 = op.s1s[w], op.s2s[w], op.s3s[w], op.s4s[w]
+            while true
+                k = Threads.atomic_add!(next, 1)
+                k > length(order) && break
+                _apply_frame!(y, x, op, order[k], s1, s2, s3, s4)
+            end
         end
-        mul!(reshape(Y, mm * mp, m0), reshape(X, mm * mp, m0),
-             w0, 1.0, 1.0)                        # w symmetric
     end
     return y
 end
 
-"""Lowest k levels; dense below `dense_limit`, ARPACK above (warm-startable
-via `v0`, as in the two-flavor solver)."""
-function o2_solve(sector::O2Sector; k = 2, dense_limit = 3000, tol = 1e-9,
-                  v0 = nothing)
-    sector.dim == 0 && return Float64[]
-    sector.dim <= dense_limit &&
-        return o2_eigenvalues(sector; k = min(k, sector.dim))
-    HAVE_ARPACK || error("Arpack.jl required for dim > $dense_limit")
-    # small per-task GEMMs from many Julia threads: keep BLAS single-threaded
-    # to avoid pool contention (measured on the two-flavor solver)
+"""Diagonal of H in the coupled basis: the channel-diagonal part (scalar and the
+diagonals of W_0, W_+, W_-) plus, for every task that maps a frame to itself,
+coef rp[a,a] rm[b,b] on its path-diagonal columns and S[j,j] r0[a0,a0] rp rm on
+the diagonal of its same-J0-group Kronecker blocks.  The Davidson
+preconditioner; checked against the dense matrix by o2_validate."""
+function o2_hdiag(sector::O2Sector)
+    d = zeros(sector.dim)
+    for (off, scalar, w0, wp, wm) in sector.diagonal
+        m0, mp, mm = size(w0, 1), size(wp, 1), size(wm, 1)
+        for a0 in 1:m0, ap in 1:mp, am in 1:mm
+            d[off+((a0-1)*mp+(ap-1))*mm+am] = scalar + w0[a0, a0] + wp[ap, ap] +
+                                              wm[am, am]
+        end
+    end
+    for t in sector.tasks
+        t.fout == t.fin || continue
+        F = sector.frames[t.fout]
+        nr = F.mm * F.mp
+        rd = vec([(t.rp === nothing ? 1.0 : t.rp[ap, ap]) *
+                  (t.rm === nothing ? 1.0 : t.rm[am, am])
+                  for am in 1:F.mm, ap in 1:F.mp])       # index (ap-1) mm + am
+        for (ci, co, m0w, c) in t.dpairs
+            ci == co || continue
+            for a in 1:m0w, r in 1:nr
+                d[F.offset+(ci+a-1)*nr+r] += c * rd[r]
+            end
+        end
+        for b in t.fentries
+            b.ci == b.co || continue
+            m0 = size(b.r0, 1)
+            for jj in 1:b.nci, a0 in 1:m0
+                v = kron_s(t, b, jj, jj) * b.r0[a0, a0]
+                v == 0.0 && continue
+                col = b.ci + (jj - 1) * m0 + a0
+                for r in 1:nr
+                    d[F.offset+(col-1)*nr+r] += v * rd[r]
+                end
+            end
+        end
+    end
+    for t in sector.pmtasks
+        t.fout == t.fin || continue
+        F = sector.frames[t.fout]
+        nr = F.mm * F.mp
+        for (ci, co, m0w, k) in t.paths
+            ci == co || continue
+            M = t.mats[k]
+            for a in 1:m0w, r in 1:nr
+                d[F.offset+(ci+a-1)*nr+r] += M[r, r]
+            end
+        end
+    end
+    return d
+end
+
+# ---- charge-conjugation halves (O2Sector(...; cpar = +-1)) -------------------
+
+"""Reduced vector -> full coupled-basis vector of definite C parity."""
+function c_expand!(x::AbstractVector{Float64}, s::O2Sector, xr::AbstractVector{Float64})
+    fill!(x, 0.0)
+    r = inv(sqrt(2.0))
+    @inbounds for k in eachindex(s.rep)
+        if s.partner[k] == 0
+            x[s.rep[k]] = xr[k]
+        else
+            x[s.rep[k]] = r * xr[k]
+            x[s.partner[k]] = s.coef[k] * r * xr[k]
+        end
+    end
+    return x
+end
+
+"""Full vector -> reduced coordinates by orthogonal projection."""
+function c_reduce!(xr::AbstractVector{Float64}, s::O2Sector, x::AbstractVector{Float64})
+    r = inv(sqrt(2.0))
+    @inbounds for k in eachindex(s.rep)
+        p = s.partner[k]
+        xr[k] = p == 0 ? x[s.rep[k]] : r * (x[s.rep[k]] + s.coef[k] * x[p])
+    end
+    return xr
+end
+
+"""H on a C half.  The input is expanded to a full vector of definite parity;
+H x then has the same parity, so its reduced coordinates follow from the
+representative entries alone, which lie in the frames with J_+ >= J_- -- the
+only output frames the half's task list and operator compute."""
+struct O2COperator <: AbstractMatrix{Float64}
+    op::O2Operator
+    x::Vector{Float64}
+    y::Vector{Float64}
+end
+
+O2COperator(s::O2Sector) = O2COperator(O2Operator(s), zeros(s.dim), zeros(s.dim))
+Base.size(A::O2COperator) = (o2_rdim(A.op.sector), o2_rdim(A.op.sector))
+Base.size(A::O2COperator, i::Int) = o2_rdim(A.op.sector)
+Base.eltype(::O2COperator) = Float64
+LinearAlgebra.ishermitian(::O2COperator) = true
+
+function LinearAlgebra.mul!(yr::AbstractVector, A::O2COperator, xr::AbstractVector)
+    s = A.op.sector
+    c_expand!(A.x, s, xr)
+    mul!(A.y, A.op, A.x)
+    q = sqrt(2.0)
+    @inbounds for k in eachindex(s.rep)
+        yr[k] = s.partner[k] == 0 ? A.y[s.rep[k]] : q * A.y[s.rep[k]]
+    end
+    return yr
+end
+
+"""Iterative eigensolve of a block or of a C half: Davidson with the diagonal of
+H (default) or ARPACK.  Both stop at |r| <= tol |E|.  Returns (values, vectors
+in the full coupled basis, matvec count)."""
+function _o2_iterative(sector::O2Sector, k, tol, v0, solver)
+    # BLAS on one thread: the small dense steps of both solvers are faster so
     Threads.nthreads() > 1 && LinearAlgebra.BLAS.set_num_threads(1)
-    op = O2Operator(sector)
-    kwargs = v0 === nothing ? (;) : (; v0 = v0 ./ norm(v0))
-    values, _ = Arpack.eigs(op; nev = k, which = :SR, tol = tol,
-                            ncv = min(sector.dim - 1, max(20, 10 * k)),
-                            maxiter = 3000, kwargs...)
-    return sort(real.(values))
+    half = sector.cpar != 0
+    op = half ? O2COperator(sector) : O2Operator(sector)
+    n = size(op, 1)
+    start = v0 === nothing ? nothing : half ? c_reduce!(zeros(n), sector, v0) : v0
+    if solver == :davidson
+        dg = o2_hdiag(sector)
+        values, reduced, nmult = davidson(op, half ? dg[sector.rep] : dg;
+                                          k = k, tol = tol, v0 = start)
+    else
+        solver == :arpack || error("solver = :davidson or :arpack")
+        HAVE_ARPACK || error("Arpack.jl required for the :arpack solver")
+        kwargs = start === nothing ? (;) : (; v0 = start ./ norm(start))
+        vals, vecs, _, _, nmult = Arpack.eigs(op; nev = k, which = :SR, tol = tol,
+                                              ncv = min(n - 1, max(20, 10 * k)),
+                                              maxiter = 3000, kwargs...)
+        ix = sortperm(real.(vals))
+        values, reduced = real.(vals[ix]), real.(vecs[:, ix])
+    end
+    half || return values, reduced, nmult
+    full = zeros(sector.dim, length(values))
+    for c in axes(reduced, 2)
+        c_expand!(view(full, :, c), sector, view(reduced, :, c))
+    end
+    return values, full, nmult
+end
+
+"""Dense eigensystem of a C half from its reduced matrix (small blocks)."""
+function _o2_half_dense(sector::O2Sector, k)
+    A = O2COperator(sector)
+    n = size(A, 1)
+    M = zeros(n, n)
+    e = zeros(n)
+    for c in 1:n
+        e[c] = 1.0
+        mul!(view(M, :, c), A, e)
+        e[c] = 0.0
+    end
+    F = eigen(Symmetric(0.5 .* (M .+ M')))
+    kk = min(k, n)
+    full = zeros(sector.dim, kk)
+    for c in 1:kk
+        c_expand!(view(full, :, c), sector, view(F.vectors, :, c))
+    end
+    return F.values[1:kk], full
+end
+
+"""Lowest k levels; dense below `dense_limit`, else Davidson (`solver =
+:davidson`, the default) or ARPACK (`:arpack`), warm-startable via `v0`."""
+function o2_solve(sector::O2Sector; k = 2, dense_limit = 3000, tol = 1e-9,
+                  v0 = nothing, solver = :davidson)
+    o2_rdim(sector) == 0 && return Float64[]
+    if o2_rdim(sector) <= dense_limit
+        sector.cpar == 0 || return _o2_half_dense(sector, k)[1]
+        return o2_eigenvalues(sector; k = min(k, sector.dim))
+    end
+    return _o2_iterative(sector, k, tol, v0, solver)[1]
 end
 
 # -----------------------------------------------------------------------------
@@ -1011,26 +1523,21 @@ function o2_brute_block(N, ps, D, two_lz, Q)
     return sort(eigvals(Symmetric(0.5 .* (H .+ H'))))
 end
 
-"""Lowest k levels AND eigenvectors (dense below `dense_limit`, ARPACK
-above)."""
+"""Lowest k levels AND eigenvectors (dense below `dense_limit`, else Davidson
+or ARPACK as in `o2_solve`)."""
 function o2_eigensystem(sector::O2Sector; k = 2, dense_limit = 3000,
-                        tol = 1e-9, v0 = nothing)
-    sector.dim == 0 && return Float64[], zeros(0, 0)
+                        tol = 1e-9, v0 = nothing, solver = :davidson)
+    o2_rdim(sector) == 0 && return Float64[], zeros(sector.dim, 0)
+    o2_rdim(sector) <= dense_limit && sector.cpar != 0 &&
+        return _o2_half_dense(sector, k)
     if sector.dim <= dense_limit
         M = dense_o2(sector)
         F = eigen(Symmetric(0.5 .* (M .+ M')))
         kk = min(k, sector.dim)
         return F.values[1:kk], F.vectors[:, 1:kk]
     end
-    HAVE_ARPACK || error("Arpack.jl required for dim > $dense_limit")
-    Threads.nthreads() > 1 && LinearAlgebra.BLAS.set_num_threads(1)
-    op = O2Operator(sector)
-    kwargs = v0 === nothing ? (;) : (; v0 = v0 ./ norm(v0))
-    vals, vecs = Arpack.eigs(op; nev = k, which = :SR, tol = tol,
-                             ncv = min(sector.dim - 1, max(20, 10 * k)),
-                             maxiter = 3000, kwargs...)
-    ix = sortperm(real.(vals))
-    return real.(vals[ix]), real.(vecs[:, ix])
+    values, vectors, _ = _o2_iterative(sector, k, tol, v0, solver)
+    return values, vectors
 end
 
 """<v| n_+ + n_- |v>: the Hellmann-Feynman slope dE/dD (the anisotropy
@@ -1140,6 +1647,26 @@ function o2_validate()
     check("chain-scalar closed form vs explicit CG", worst < 1e-12,
           @sprintf("worst = %.1e over %d samples", worst, tried))
 
+    # 9j with a zero entry as one 6j, against the general 9j sum
+    rngz = Random.MersenneTwister(11)
+    worst = 0.0
+    for _ in 1:300
+        tri(x, y) = abs(x - y):2:(x + y)
+        a, b, d = rand(rngz, 0:12, 3)
+        c, g = rand(rngz, tri(a, b)), rand(rngz, tri(a, d))
+        ir = intersect(tri(c, d), tri(g, b))
+        isempty(ir) || (i = rand(rngz, ir);
+            worst = max(worst, abs(ninej(a, b, c, d, 0, d, g, b, i) -
+                                   ninej_zero22(a, b, c, d, d, g, b, i))))
+        h = rand(rngz, tri(b, d))
+        ir = intersect(tri(c, d), tri(a, h))
+        isempty(ir) || (i = rand(rngz, ir);
+            worst = max(worst, abs(ninej(a, b, c, 0, d, d, a, h, i) -
+                                   ninej_zero21(a, b, c, d, d, a, h, i))))
+    end
+    check("9j with a zero entry = one 6j", worst < 1e-12,
+          @sprintf("worst = %.1e over 600 samples", worst))
+
     # brute force, literal Hamiltonian, N = 4 and 5: every (Lz, Q) block
     for (N, blocks) in ((4, [(0, 0), (0, 2), (1, 0), (2, 0), (1, 4)]),
                         (5, [(0, 0), (0, 2), (1, 0), (2, 0), (3, 0)]))
@@ -1215,11 +1742,52 @@ function o2_validate()
         M = dense_o2(s)
         x = randn(rng, s.dim)
         y = zeros(s.dim)
-        mul!(y, O2Operator(s), x)
-        worst = max(worst, maximum(abs.(M * x .- y)) / max(1.0, norm(x)))
+        for rows in (:auto, :explicit, :factorized)
+            mul!(y, O2Operator(s; rows = rows), x)
+            worst = max(worst, maximum(abs.(M * x .- y)) / max(1.0, norm(x)))
+        end
     end
-    check("matvec vs dense assembly (N = 6)", worst < 1e-10,
+    check("matvec vs dense, explicit and factorized rows (N = 6)", worst < 1e-10,
           @sprintf("worst = %.1e", worst))
+
+    # merged (+-) tasks: the same operator as the separate lambda tasks
+    let worst = 0.0, nmerged = 0, rngm = Random.MersenneTwister(7)
+        for (N, L, Q) in ((7, 0, 0), (7, 2, 0), (8, 1, 1), (8, 2, 0))
+            sm = O2Sector(N, 2.9600, ps, L, Q)
+            su = O2Sector(N, 2.9600, ps, L, Q; merge_pm = false)
+            nmerged += length(sm.pmtasks)
+            x = randn(rngm, sm.dim)
+            ym, yu = zeros(sm.dim), zeros(sm.dim)
+            mul!(ym, O2Operator(sm), x)
+            mul!(yu, O2Operator(su), x)
+            worst = max(worst, maximum(abs.(ym .- yu)) / norm(x),
+                        maximum(abs.(o2_hdiag(sm) .- o2_hdiag(su))))
+        end
+        check("merged (+-) tasks = separate lambda tasks (matvec, diagonal)",
+              worst < 1e-12 && nmerged > 0,
+              @sprintf("worst = %.1e, %d merged tasks", worst, nmerged))
+    end
+
+    # Davidson preconditioner: o2_hdiag is the exact diagonal of H
+    worst = 0.0
+    for (L, Q) in ((0, 0), (1, 1), (2, 0), (3, 0))
+        s = O2Sector(6, 2.9600, ps, L, Q)
+        s.dim == 0 && continue
+        worst = max(worst, maximum(abs.(diag(dense_o2(s)) .- o2_hdiag(s))))
+    end
+    check("o2_hdiag = diagonal of the dense matrix (N = 6)", worst < 1e-12,
+          @sprintf("worst = %.1e", worst))
+
+    # Davidson and ARPACK agree with the dense spectrum
+    let s = O2Sector(8, 2.9600, ps, 2, 0), worst = 0.0
+        ref = o2_eigenvalues(s; k = 3)
+        for solver in (:davidson, :arpack)
+            e = o2_solve(s; k = 3, dense_limit = 0, tol = 1e-10, solver = solver)
+            worst = max(worst, maximum(abs.(e .- ref)))
+        end
+        check("Davidson and ARPACK vs dense (N = 8, (L, Q) = (2, 0), 3 levels)",
+              worst < 1e-9, @sprintf("max |dE| = %.1e", worst))
+    end
 
     # charge conjugation: involution, commutation with H, and the parity
     # pattern that fixes the stress-tensor identification -- the lowest
@@ -1267,6 +1835,41 @@ function o2_validate()
         end
         check("C-projected k=1 reproduces the full k=2 pair", worst < 1e-10,
               @sprintf("worst = %.1e", worst))
+    end
+
+    # charge-conjugation halves: together they hold the whole block, each
+    # vector has the requested parity, and the iterative path on a half
+    # reproduces the C-resolved levels of the full block
+    let worst = 0.0, dims_ok = true, par_ok = true
+        for (L, N) in ((0, 7), (1, 7), (2, 6), (3, 7))
+            full = O2Sector(N, 2.9600, ps, L, 0)
+            full.dim == 0 && continue
+            halves = [O2Sector(N, 2.9600, ps, L, 0; cpar = p) for p in (1, -1)]
+            dims_ok &= sum(o2_rdim, halves) == full.dim
+            lev = Float64[]
+            for (h, p) in zip(halves, (1, -1))
+                o2_rdim(h) == 0 && continue
+                e, v = _o2_half_dense(h, o2_rdim(h))
+                append!(lev, e)
+                par_ok &= all(abs(c_parity(h, view(v, :, c)) - p) < 1e-10
+                              for c in axes(v, 2))
+            end
+            worst = max(worst, maximum(abs.(sort(lev) .- o2_eigenvalues(full; k = full.dim))))
+        end
+        check("C halves: dims add up, parities, union = full spectrum", dims_ok && par_ok &&
+              worst < 1e-10, @sprintf("max |dE| = %.1e", worst))
+    end
+    let s = O2Sector(8, 2.8747, ps, 2, 0), worst = 0.0
+        ev = o2_eigenvalues(s; k = 2)                # lowest C-odd, then T (C-even)
+        for solver in (:davidson, :arpack)
+            em = o2_solve(O2Sector(8, 2.8747, ps, 2, 0; cpar = -1); k = 1,
+                          dense_limit = 0, tol = 1e-10, solver = solver)
+            ep = o2_solve(O2Sector(8, 2.8747, ps, 2, 0; cpar = +1); k = 1,
+                          dense_limit = 0, tol = 1e-10, solver = solver)
+            worst = max(worst, abs(em[1] - ev[1]), abs(ep[1] - ev[2]))
+        end
+        check("C halves, iterative: (2,0) C-odd = level 1, C-even (T) = level 2",
+              worst < 1e-9, @sprintf("max |dE| = %.1e", worst))
     end
 
     @printf("\n%d/%d checks passed\n", passes, passes + fails)
