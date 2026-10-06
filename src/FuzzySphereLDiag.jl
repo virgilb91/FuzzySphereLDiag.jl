@@ -19,18 +19,17 @@ Two ingredients:
 
 Models: the two-flavour Ising model and the three-flavour (spin-1) O(2) model.
 
-Conventions that differ from FuzzifiED, and matter:
+Conventions that differ from FuzzifiED:
 
   * Ising: `ps_pot[l+1] = V_l`.  FuzzifiED's `GetDenIntTerms` takes
     `2 .* ps_pot` when the two flavour projectors are passed separately.
   * O(2): `D` is the anisotropy of the LITERAL Hamiltonian, as in Dey et al.,
     arXiv:2604.18705.
     FuzzifiED normal-orders, and its anisotropy is `D + kappa(N,V0,V1)/2`.
-    Omitting the shift changes the spectrum entirely -- see `examples/tutorial_o2.jl`.
+    Omitting the shift changes the spectrum entirely -- see `examples/tutorial.jl`.
 
-Run `examples/tutorial_ising.jl` and `examples/tutorial_o2.jl` for cross-code
-checks against FuzzifiED, and the first of the two for a reduced-basis energy
-surface.
+Run `examples/tutorial.jl` for a cross-code check against FuzzifiED and a
+reduced-basis energy surface.
 """
 module FuzzySphereLDiag
 
@@ -41,11 +40,13 @@ using .JScheme
 
 # ---------------------------------------------------------------- Ising -----
 """
-    IsingSector(N, h, ps_pot, L, z2)
+    IsingSector(N, h, ps_pot, L, z2; ph = 0)
 
 Exact-(L, Z2) block of the fuzzy-sphere Ising model: `N` orbitals, transverse
 field `h`, Haldane pseudopotentials `ps_pot[l+1] = V_l`, Ising parity
-`z2 = (-1)^{n_-}` in the sigma^x basis.
+`z2 = (-1)^{n_-}` in the sigma^x basis.  `ph = +-1` keeps one half of the
+block, of definite particle-hole parity (FuzzifiED's P R_y label); the
+lowest levels used for spectroscopy are in `ph = +1`.
 """
 const IsingSector = JScheme.Sector
 
@@ -56,15 +57,20 @@ ising_states(s; k = 2, kwargs...) = JScheme.eigensystem(s; k = k, kwargs...)
 
 # ------------------------------------------------------------------ O(2) ----
 """
-    O2Sector(N, D, ps_pot, L, Q)
+    O2Sector(N, D, ps_pot, L, Q; cpar = 0)
 
 Exact-(L, Q) block of the three-flavour (spin-1) O(2) model.  `D` is the
-LITERAL single-ion anisotropy (see [`kappa`](@ref)).
+LITERAL single-ion anisotropy (see [`kappa`](@ref)).  At `Q = 0`,
+`cpar = +-1` keeps one charge-conjugation half of the block (FuzzifiED's
+`GetFlavPermQNOffd(N, 3, [3, 2, 1])` label); the identity and T are in the
+`cpar = +1` half.
 """
 const O2Sector = JScheme.O2Sector
 
-"`o2_levels(sector; k)` -- the `k` lowest eigenvalues of an `O2Sector`."
-o2_levels(s; k = 2, kwargs...) = JScheme.o2_eigenvalues(s; k = k, kwargs...)
+"""`o2_levels(sector; k)` -- the `k` lowest eigenvalues of an `O2Sector` (or of
+its C half): dense below `dense_limit = 3000`, Davidson above (`solver =
+:arpack` for ARPACK)."""
+o2_levels(s; k = 2, kwargs...) = JScheme.o2_solve(s; k = k, kwargs...)
 
 """
     o2_ground_cparity(sector, parity)
@@ -87,7 +93,6 @@ kappa(N, V0, V1 = 1.0) = ((2N - 1) * V0 - (2N - 3) * V1) / N
 
 # ---------------------------------------------------- reduced basis ---------
 include("rbm.jl")
-include("observables.jl")
 
 """
     jscheme_ising_affine(N, L, z2)
@@ -97,31 +102,7 @@ solver, ready for [`greedy`](@ref).  Parameters are `θ = (V0, h)` at `V1 = 1`.
 
 Returns `(H, solve)`.  This is the adapter pattern: any backend that can apply
 its affine Hamiltonian pieces to a vector and solve at a point plugs in the
-same way -- see `examples/tutorial_ising.jl`, which drives `greedy` with it.
-
-# Example
-
-```julia
-julia> H, solve = jscheme_ising_affine(8, 0, +1);
-
-julia> H.dim, nparams(H)                  # states in the block, and (V0, h)
-(22, 2)
-
-julia> solve([4.75, 3.16], 1)[1][1]       # one exact solve at that point
--13.402668753283322
-
-julia> em = greedy(H, solve, [(3.8, 5.8), (3.02, 3.32)]; k = 1, tol = 1e-9);
-
-julia> length(em.pts)                     # exact solves the greedy needed
-8
-
-julia> emulate(em, (4.75, 3.16))[1]       # same energy, from the reduced basis
--13.402668753282999
-```
-
-`solve` also takes an optional third argument, a starting vector, which
-[`greedy`](@ref) uses to warm-start each new exact solve from the emulator's
-own prediction.
+same way -- see `examples/tutorial.jl` for the FuzzifiED adapter.
 """
 function jscheme_ising_affine(N, L, z2; dense_limit = 64)
     S0 = JScheme.Sector(N, 0.0, 0.0, 1.0, L, z2)    # V1 = 1 only
@@ -133,37 +114,8 @@ function jscheme_ising_affine(N, L, z2; dense_limit = 64)
     diff(j) = x -> (y = zeros(dim); mul!(y, ops[1], x);
                     z = zeros(dim); mul!(z, ops[j], x); z .- y)
     H = AffineOperator(Function[base, diff(2), diff(3)], dim)
-    solve(θ, k, guess = nothing) =
-        JScheme.eigensystem(JScheme.Sector(N, θ[2], θ[1], 1.0, L, z2);
-                            k = k, dense_limit = dense_limit,
-                            v0 = guess === nothing ? nothing : Vector{Float64}(guess))
-    H, solve
-end
-
-"""
-    o2_affine(N, L, Q; V1 = 1.0)
-
-The O(2) counterpart of [`jscheme_ising_affine`](@ref): wrap the exact-`(L, Q)`
-sector as an [`AffineOperator`](@ref) plus a solver, ready for [`greedy`](@ref).
-Parameters are `θ = (V0, D)` at fixed `V1`, with `D` the literal anisotropy.
-
-Returns `(H, solve)`.
-"""
-function o2_affine(N, L, Q; V1 = 1.0, dense_limit = 3000)
-    S0 = JScheme.O2Sector(N, 0.0, [0.0, V1], L, Q)   # the V1 term alone
-    Sv = JScheme.O2Sector(N, 0.0, [1.0, V1], L, Q)   # + the V0 piece
-    Sd = JScheme.O2Sector(N, 1.0, [0.0, V1], L, Q)   # + the D piece
-    ops = [JScheme.O2Operator(s) for s in (S0, Sv, Sd)]
-    dim = S0.dim
-    base(x) = (y = zeros(dim); mul!(y, ops[1], x); y)
-    diff(j) = x -> (y = zeros(dim); mul!(y, ops[1], x);
-                    z = zeros(dim); mul!(z, ops[j], x); z .- y)
-    H = AffineOperator(Function[base, diff(2), diff(3)], dim)
-    solve(θ, k, guess = nothing) =
-        JScheme.o2_eigensystem(JScheme.O2Sector(N, θ[2], [θ[1], V1], L, Q);
-                               k = k, dense_limit = dense_limit,
-                               v0 = guess === nothing ? nothing :
-                                    Vector{Float64}(guess))
+    solve(θ, k) = JScheme.eigensystem(JScheme.Sector(N, θ[2], θ[1], 1.0, L, z2);
+                                      k = k, dense_limit = dense_limit)
     H, solve
 end
 
@@ -182,9 +134,7 @@ end
 
 export IsingSector, O2Sector, ising_levels, ising_states, o2_levels,
        o2_ground_cparity, kappa,
-       AffineOperator, Emulator, emulate, emulate_state, greedy, nparams,
-       apply_order_param, ising_order_param_gram, o2_order_param_gram,
-       reduced_expectation, ising_order_parameter, o2_order_parameter,
-       jscheme_ising_affine, o2_affine, ising_emulator, JScheme
+       AffineOperator, Emulator, emulate, greedy, nparams,
+       jscheme_ising_affine, ising_emulator, JScheme
 
 end # module
